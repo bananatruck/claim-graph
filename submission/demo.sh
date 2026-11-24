@@ -9,8 +9,16 @@ pause=${PAUSE:-3}
 mkdir -p out
 
 step() {
+  # Print the command so it can be copied: plain words as they are, anything else in
+  # single quotes.
   printf '\n$ claim-graph'
-  printf ' %q' "$@"
+  for arg in "$@"; do
+    if [[ $arg =~ ^[A-Za-z0-9_./:%=-]+$ ]]; then
+      printf ' %s' "$arg"
+    else
+      printf " '%s'" "${arg//\'/\'\\\'\'}"
+    fi
+  done
   printf '\n'
   "$cg" "$@"
   sleep "$pause"
