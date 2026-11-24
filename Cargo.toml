@@ -1,0 +1,16 @@
+[package]
+name = "claim-graph"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Report every claim in a research draft that has no path to a run or a citation, using a Relate graph store."
+publish = false
+
+[dependencies]
+clap = { version = "4.6.10", features = ["derive"] }
+relate = { version = "=1.2.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"
