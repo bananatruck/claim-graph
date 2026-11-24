@@ -1,68 +1,128 @@
 # Claim Graph
 
-Find every claim in a research agent's paper draft that has no path to a completed run or a cited source.
-
-Status: walking skeleton.
-The `ingest` and `unsupported` commands work end to end on a real Relate store; the rest of the plan is in [SPEC.md](SPEC.md).
+Find the claims in a research agent's draft that rest on nothing, on a superseded experiment, or on a number the cited run never produced.
 
 ## Use case
 
-An AI research agent can run experiments and write a fluent draft about them, and some sentences in that draft are not backed by anything it ran or read.
-Claim Graph reads the draft and the agent's run log into one graph and asks a single question of it: which claims have no path to evidence?
-The relationships that matter are claim to source (`CITES`), claim to run or experiment (`SUPPORTED_BY`), experiment to run (`HAS_RUN`) and run to metric (`PRODUCED`).
-A claim is supported when a path leads from it to a listed source or to a run whose status is `completed`.
-That one rule catches a sentence with no reference, a claim about an experiment that never ran, a claim resting on a crashed run, and a citation that is missing from the bibliography.
+AI research agents now run experiments and write the first draft of the paper about them.
+The prose is fluent, and some of it is not backed by anything the agent ran or read: an experiment that never ran, a run that crashed, a citation missing from the bibliography, a pilot that a later experiment replaced, or an abstract that says 74.2% when the run produced 73.9%.
+The person who signs the paper has to catch these before a reviewer does.
+
+Claim Graph reads the draft (Markdown) and the agent's run log (JSON Lines) into one Relate graph and checks the claims against it.
+The relationships that carry the answer are:
+
+- claim to source (`CITES`), and draft to source (`LISTS`), so a citation counts only if the bibliography lists it;
+- claim to run or experiment (`SUPPORTED_BY`), and experiment to run (`HAS_RUN`), so a claim counts as supported only through a completed run;
+- experiment to experiment (`SUPERSEDES`), followed to any depth, so a claim on a replaced pilot is flagged with the newest results;
+- claim to number (`STATES`), number to metric (`MATCHES`) or to a difference of two metrics (`DERIVED_AS`, `MINUEND`, `SUBTRAHEND`), and run to metric (`PRODUCED`), so every number in the text can be walked back to the run that produced it, or shown to have no source.
+
+A sentence is checked when it contains a number, a comparison word, a citation or a run or experiment link; every other sentence is counted as prose and listed only with `--prose`.
+The rule is deterministic and lives in one replaceable function (`src/classify.rs`).
 
 ## How it uses Relate
 
 - Mode: single file.
-- Why this mode: the graph is rebuilt from two input files by one process that then exits, and a single `.rl` file is one artifact that can be committed, copied and opened by anyone.
-- What the graph models: `Draft`, `Claim`, `Source`, `Experiment`, `Run` and `Metric` nodes, joined by `HAS_CLAIM`, `LISTS`, `CITES`, `SUPPORTED_BY`, `HAS_RUN` and `PRODUCED` relationships (full model in [SPEC.md](SPEC.md#graph-model)).
-- Relate is embedded through the `relate` Rust crate (version 1.2.0 from crates.io), built without its default `parquet` feature, so the store uses Relate's JSON snapshot codec inside the `.rl` file.
-- `ingest` writes the whole graph in one Relate transaction and checkpoints the store; `unsupported` reopens it read-only and answers with this Cypher query:
+- Why this mode: the graph is rebuilt from two input files by one process that then exits, and a single `.rl` file is one artifact a judge can copy, open and query.
+  A directory store would split it into a snapshot and a WAL folder; `claim-graph dump` gives a diffable text view instead.
+- What the graph models: `Draft`, `Sentence`/`Claim`, `Source`, `Experiment`, `Run`, `Metric`, `Figure` and `Derivation` nodes, joined by the relationships above (full model in [SPEC.md](SPEC.md#graph-model)).
+- Relate is embedded through the `relate` Rust crate, version 1.2.0 from crates.io, built without its default `parquet` feature, so the store uses Relate's JSON snapshot codec inside the `.rl` file.
+- Ingest writes everything in one Relate transaction, and the matching of numbers to metrics runs as Cypher inside it.
+- Every answer is a Cypher query on the reopened store, opened read-only; all queries are in [`src/queries.rs`](src/queries.rs).
+  For example, the unsupported-claims check:
 
 ```cypher
 MATCH (c:Claim)
 WHERE NOT EXISTS {
   MATCH (c)-[:CITES|SUPPORTED_BY|HAS_RUN*1..2]->(t)
-  WHERE t:Source OR (t:Run AND t.status = 'completed')
+  WHERE (t:Source AND EXISTS { MATCH (:Draft)-[:LISTS]->(t) })
+     OR (t:Run AND t.status = 'completed')
 }
-RETURN c.id AS id, c.section AS section, c.text AS text, c.unresolved AS unresolved
+RETURN c.id AS id, c.section AS section, c.text AS text
 ORDER BY c.ordinal
 ```
 
+Relate capabilities used: embedded Rust API, single-file `.rl` store, explicit transactions, read-only opens, query parameters, `MERGE ... ON CREATE SET`, `EXISTS`/`COUNT`/`COLLECT` subqueries, variable-length paths (`*1..2` and unbounded `SUPERSEDES*1..`), path functions (`nodes(p)`), and `labels`/`properties` for the canonical dump.
+
 ## Setup and run
 
-Prerequisites: Rust 1.88 or later with Cargo.
+Prerequisites: Rust 1.88 or later with Cargo, and a network connection for the first build to fetch crates.
 The first build compiles the Relate engine from source and takes a few minutes.
 
 ```bash
+git clone <this repository> claim-graph && cd claim-graph
 cargo build --release
-./target/release/claim-graph ingest \
-  --draft data/synthetic/draft.md \
-  --runs data/synthetic/runs.jsonl \
-  --store store/claim-graph.rl --replace
-./target/release/claim-graph unsupported --store store/claim-graph.rl
 ```
 
-Output of the last command on the synthetic data:
+The committed stores are ready to query:
+
+```bash
+./target/release/claim-graph unsupported --store store/claim-graph.rl
+./target/release/claim-graph explain --store store/claim-graph.rl --claim C2
+./target/release/claim-graph trace --store store/claim-graph.rl --figure "71.3%"
+./target/release/claim-graph audit --store store/messy.rl
+```
+
+Output of the last command:
 
 ```text
-4 of 7 claims have no path to a completed run or a cited source:
+Unsupported claims
 
-C3  [Abstract]  The planner also halves the number of tool calls per task.
-C4  [Results]  Retrieval helps most on long tasks [exp:E2].
-C6  [Results]  Ablating the critic lowers success to 65.0% [run:r-004].
-C7  [Results]  The gains match those reported for larger planners [@okafor2023].
-    unresolved: @okafor2023
+2 of 8 claims have no path to a completed run or a cited source:
+
+C7  [Results]  A second seed confirms the result [run:m-99].
+    unresolved: run:m-99
+C8  [Results]  Fig. 3 shows the error rate by notebook length.
+
+Claims on superseded experiments
+
+Stale: C5 rests on m-01, from experiment E10, which is superseded: E12 supersedes E11 supersedes E10
+  newest results (E12): m-06 accuracy = 0.695; m-06 tool_calls_per_question = 6.8; m-07 accuracy = 0.739; m-07 tool_calls_per_question = 4.21
+
+Figures the cited runs did not produce
+
+C1 states 74.2%, but its cited runs measured: m-07 accuracy = 0.739; m-07 tool_calls_per_question = 4.21
+    the values those runs produced are stated by C3, C4
+
+4 findings.
 ```
 
-Add `--format json` for machine-readable output.
+Explore the graph with any read-only Cypher, without installing anything else:
+
+```bash
+./target/release/claim-graph query --store store/messy.rl \
+  "MATCH p = (:Experiment)-[:SUPERSEDES*]->(:Experiment) RETURN [n IN nodes(p) | n.id] AS chain"
+```
+
+Rebuild a store from its inputs, or build one from your own draft and run log (formats in [SPEC.md](SPEC.md#inputs)):
+
+```bash
+./target/release/claim-graph ingest --replace \
+  --draft data/synthetic/draft.md --runs data/synthetic/runs.jsonl --store store/claim-graph.rl
+```
+
+Other options: `--format json` on every reading command, `--prose` on `unsupported`, and `--fail` on `unsupported` and `audit` to exit with status 3 when there are findings, for use in a pipeline.
+`claim-graph --help` and `claim-graph <command> --help` list everything.
 Run the tests with `cargo test`.
+
+The store is an ordinary Relate store, so the `relate` CLI should open it too (`relate --database store/claim-graph.rl --read-only "MATCH (c:Claim) RETURN c.id, c.text"`); that path has not been tested in this project.
 
 ## Where the data lives
 
-- Persistent Relate store: [`store/claim-graph.rl`](store/claim-graph.rl), built from the inputs below by the command above.
-- Inputs: [`data/synthetic/draft.md`](data/synthetic/draft.md) and [`data/synthetic/runs.jsonl`](data/synthetic/runs.jsonl).
-  Both are synthetic test data written by hand; no experiment in them was run and the cited works do not exist.
-- Rebuilding the store gives the same graph, but not the same bytes, so the file changes on every rebuild.
+- Persistent Relate stores: [`store/claim-graph.rl`](store/claim-graph.rl) (tidy draft) and [`store/messy.rl`](store/messy.rl) (messy draft).
+- Their inputs: [`data/synthetic/`](data/synthetic/) and [`data/synthetic/messy/`](data/synthetic/messy/).
+  All inputs are synthetic test data written by hand; no experiment in them was run and the cited works do not exist.
+- Relate's `.rl` bytes differ on every rebuild, so the stores are checked by content: `cargo test` rebuilds both and compares `claim-graph dump` of each with the committed file.
+  `scripts/rebuild-stores.sh` regenerates them with the commands above.
+
+## Limits
+
+- Sentence splitting and the claim rule are deterministic heuristics; they over-report rather than miss (for example "Fig. 3 shows..." counts as a claim because it holds a number).
+- Only `[@key]`, `[run:ID]` and `[exp:ID]` references are recognised.
+- Numbers match by value and written precision, so an unrelated metric with the same value can match; `trace` shows every match.
+- Bare integers are treated as counts and never matched to metrics.
+- Claim Graph does not judge whether a source says what the claim says.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).
+Relate is Apache-2.0 and is used as a dependency, unmodified.
