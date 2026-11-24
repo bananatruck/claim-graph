@@ -1,10 +1,10 @@
-Script started on 2026-11-24 14:51:59-08:00 [COMMAND="PAUSE=2 bash submission/demo.sh" <not executed on terminal>]
+Script started on 2026-11-24 15:15:28-08:00 [COMMAND="PAUSE=2 bash submission/demo.sh" <not executed on terminal>]
 
-$ claim-graph ingest --replace --draft data/synthetic/draft.md --runs data/synthetic/runs.jsonl --store store/claim-graph.rl
+$ claim-graph ingest --replace --draft data/synthetic/draft.md --runs data/synthetic/runs.jsonl --store out/claim-graph.rl
 warning: C7 references @okafor2023, which is not defined
-wrote store/claim-graph.rl: 7 claims, 1 prose sentences, 2 sources, 3 experiments, 4 runs, 3 metrics, 4 figures, 1 figure-metric matches, 1 differences
+wrote out/claim-graph.rl: 7 claims, 1 prose sentences, 2 sources, 3 experiments, 4 runs, 3 metrics, 4 figures, 1 figure-metric matches, 1 differences
 
-$ claim-graph unsupported --store store/claim-graph.rl
+$ claim-graph unsupported --store out/claim-graph.rl
 4 of 7 claims have no path to a completed run or a cited source:
 
 C3  [Abstract]  The planner also halves the number of tool calls per task.
@@ -13,7 +13,7 @@ C6  [Results]  Ablating the critic lowers success to 65.0% [run:r-004].
 C7  [Results]  The gains match those reported for larger planners [@okafor2023].
     unresolved: @okafor2023
 
-$ claim-graph explain --store store/claim-graph.rl --claim C4
+$ claim-graph explain --store out/claim-graph.rl --claim C4
 C4  [Results]  Retrieval helps most on long tasks [exp:E2].
 Checked because it has: comparison, reference
 
@@ -23,7 +23,7 @@ References:
 Supporting paths:
   none: no path reaches a completed run or a listed source, so the claim is unsupported
 
-$ claim-graph explain --store store/claim-graph.rl --claim C2
+$ claim-graph explain --store out/claim-graph.rl --claim C2
 C2  [Abstract]  This is 6.1 points above the strongest baseline [exp:E1].
 Checked because it has: number, comparison, reference
 
@@ -39,7 +39,7 @@ Numbers:
   6.1 in C2:
     = difference of success_rate: run r-002 (0.713) minus run r-001 (0.652) in experiment E1, cited by the claim
 
-$ claim-graph trace --store store/claim-graph.rl --figure 71.3%
+$ claim-graph trace --store out/claim-graph.rl --figure 71.3%
 71.3% in C1:
   = success_rate 0.713 from run r-002 (completed) in experiment E1, cited by the claim
     other runs of E1: r-001 (completed) = 0.652; r-003 (completed) = 0.689
@@ -53,6 +53,10 @@ C7  [Results]  A second seed confirms the result [run:m-99].
     unresolved: run:m-99
 C8  [Results]  Fig. 3 shows the error rate by notebook length.
 
+Broken references on otherwise supported claims
+
+C6 cites source ndiaye2022: not listed in References
+
 Claims on superseded experiments
 
 Stale: C5 rests on m-01, from experiment E10, which is superseded: E12 supersedes E11 supersedes E10
@@ -63,13 +67,13 @@ Figures the cited runs did not produce
 C1 states 74.2%, but its cited runs measured: m-07 accuracy = 0.739; m-07 tool_calls_per_question = 4.21
     the values those runs produced are stated by C3, C4
 
-4 findings.
+5 findings.
 
-$ claim-graph query --store store/messy.rl MATCH p = (:Experiment)-[:SUPERSEDES*]->(:Experiment) RETURN [n IN nodes(p) | n.id] AS chain
+$ claim-graph query --store store/messy.rl 'MATCH p = (:Experiment)-[:SUPERSEDES*]->(:Experiment) RETURN [n IN nodes(p) | n.id] AS chain'
 chain
 ['E12', 'E11']
 ['E12', 'E11', 'E10']
 ['E11', 'E10']
 (3 rows)
 
-Script done on 2026-11-24 14:52:13-08:00 [COMMAND_EXIT_CODE="0"]
+Script done on 2026-11-24 15:15:42-08:00 [COMMAND_EXIT_CODE="0"]

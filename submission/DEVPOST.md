@@ -30,7 +30,7 @@ Claim Graph is a command-line tool that reads a Markdown draft and a JSON Lines 
 - `unsupported` lists the claims with no path to a completed run or a source the bibliography lists.
 - `explain` shows, for one claim, each reference it makes, why that reference does or does not support it, and every supporting path.
 - `trace` walks a number in the text back to the metric, run and experiment that produced it, including a number that is the difference of two runs ("6.1 points above the baseline"), and shows what the experiment's other runs measured.
-- `audit` adds two checks: claims resting on an experiment that a chain of later experiments superseded, and numbers that the runs a claim cites did not produce, naming the other claims that state the right value.
+- `audit` adds three checks: references that fail on a claim another reference supports (a citation missing from the bibliography, a crashed run), claims resting on an experiment that a chain of later experiments superseded, and numbers that the completed runs a claim cites did not produce, directly or as a difference of two of them, naming the other claims that state the right value.
 - `query` runs any read-only Cypher on the store, and `dump` prints the whole graph as sorted text.
 - `--fail` turns findings into exit status 3, so a research pipeline can refuse to ship a draft with unsupported claims.
 
@@ -63,8 +63,8 @@ TODO (Kesh): if the form asks for tools by name, list them here.
 
 ## Challenges
 
-- Making the graph decide what is missing, instead of resolving references in application code first: dangling references became nodes without the relationship that would make them count.
-- Matching numbers honestly: a figure matches a metric only within the precision it was written with, so 71.3% matches 0.7128 but not 0.714, and bare integers are treated as counts.
+- Making the graph decide what is missing, instead of resolving the draft's references in application code first: dangling references became nodes without the relationship that would make them count, and whether each reference supports its claim is decided in Cypher.
+- Matching numbers honestly: a figure matches a metric only within the precision it was written with, so 71.3% matches 0.7128 but not 0.714; signs count, version strings and model names are not numbers, bare integers are treated as counts, and a difference counts only between completed runs the claim actually cites.
 - Relate's `.rl` bytes change on every rebuild, so the committed stores are checked by content: the tests rebuild them and compare a canonical dump.
 
 ## What's next
