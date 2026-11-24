@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use claim_graph::answers::{self, Audit, Explanation, FigureTrace, Report, Stale, Table};
@@ -73,6 +73,7 @@ enum Command {
     /// Trace numbers in the draft to the metric, run and experiment that produced them.
     ///
     /// Example: claim-graph trace --store store/claim-graph.rl --figure "71.3%"
+    #[command(group(ArgGroup::new("selector").required(true).args(["figure", "claim"])))]
     Trace {
         #[command(flatten)]
         common: Common,
@@ -180,15 +181,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             figure,
             claim,
         } => {
-            if figure.is_none() && claim.is_none() {
-                return Err("trace needs --figure or --claim".into());
-            }
             let traces = answers::trace(&common.store, figure.as_deref(), claim.as_deref())
                 .map_err(|e| e.to_string())?;
             if traces.is_empty() {
                 return Err(match (figure, claim) {
                     (Some(f), _) => format!("no claim in the store states {f:?}"),
-                    (None, Some(c)) => format!("claim {c} states no numbers"),
+                    (None, Some(c)) => format!("{c} states no numbers"),
+                    // Argument parsing requires one of the two.
                     (None, None) => unreachable!(),
                 });
             }
@@ -360,6 +359,21 @@ fn render_explanation(e: &Explanation) -> String {
     for s in &e.stale {
         out.push_str(&render_stale(s));
     }
+    for m in &e.mismatches {
+        let _ = writeln!(
+            out,
+            "\nMismatch: {} is not what its cited runs measured: {}",
+            m.figure,
+            m.cited_results.join("; ")
+        );
+        if !m.stated_by.is_empty() {
+            let _ = writeln!(
+                out,
+                "  the values those runs produced are stated by {}",
+                m.stated_by.join(", ")
+            );
+        }
+    }
     if !e.figures.is_empty() {
         let _ = writeln!(out, "\nNumbers:");
         out.push_str(&render_traces(&e.figures, "  "));
@@ -452,6 +466,22 @@ fn render_audit(a: &Audit) -> String {
     let mut report = a.report.clone();
     report.prose.clear();
     out.push_str(&render_report(&report));
+    let _ = writeln!(out, "\nBroken references on otherwise supported claims\n");
+    if a.broken.is_empty() {
+        let _ = writeln!(out, "none");
+    }
+    for l in &a.broken {
+        let verb = if l.kind == "source" {
+            "cites"
+        } else {
+            "points at"
+        };
+        let _ = writeln!(
+            out,
+            "{} {verb} {} {}: {}",
+            l.claim, l.kind, l.target, l.reason
+        );
+    }
     let _ = writeln!(out, "\nClaims on superseded experiments");
     if a.stale.is_empty() {
         let _ = writeln!(out, "\nnone");

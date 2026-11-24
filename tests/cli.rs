@@ -206,7 +206,7 @@ fn audit_reports_stale_and_mismatched_claims_on_the_messy_draft() {
         stdout.contains("C1 states 74.2%, but its cited runs measured: m-07 accuracy = 0.739"),
         "{stdout}"
     );
-    assert!(stdout.contains("4 findings."), "{stdout}");
+    assert!(stdout.contains("5 findings."), "{stdout}");
 }
 
 #[test]
@@ -269,4 +269,54 @@ fn a_bad_input_reports_file_and_line() {
 #[test]
 fn missing_arguments_are_a_usage_error() {
     assert_eq!(run(&["ingest"]).status.code(), Some(2));
+}
+
+#[test]
+fn trace_needs_exactly_one_selector() {
+    let (_dir, store) = clean_store();
+    let store = store.to_str().unwrap();
+    assert_eq!(run(&["trace", "--store", store]).status.code(), Some(2));
+    assert_eq!(
+        run(&[
+            "trace", "--store", store, "--figure", "60%", "--claim", "C1"
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn trace_names_an_unknown_claim() {
+    let (_dir, store) = clean_store();
+    let out = run(&[
+        "trace",
+        "--store",
+        store.to_str().unwrap(),
+        "--claim",
+        "C99",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("no sentence with ID C99"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn audit_and_explain_show_broken_references_and_mismatches() {
+    let (_dir, store) = messy_store();
+    let store = store.to_str().unwrap();
+    let stdout = ok(&["audit", "--store", store]);
+    assert!(
+        stdout.contains("C6 cites source ndiaye2022: not listed in References"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("5 findings."), "{stdout}");
+    let stdout = ok(&["explain", "--store", store, "--claim", "C1"]);
+    assert!(
+        stdout.contains("Mismatch: 74.2% is not what its cited runs measured"),
+        "{stdout}"
+    );
 }

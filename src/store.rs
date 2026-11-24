@@ -83,6 +83,9 @@ impl From<std::io::Error> for StoreError {
 }
 
 /// Build the graph in a new store at `path`, in one transaction, then checkpoint and close it.
+///
+/// The store is built in a temporary file beside `path` and moved into place only when it
+/// is complete, so a failed ingest with `replace` leaves the previous store untouched.
 pub fn ingest(
     path: &Path,
     draft_path: &str,
@@ -90,7 +93,7 @@ pub fn ingest(
     log: &RunLog,
     replace: bool,
 ) -> Result<IngestSummary, StoreError> {
-    let uri = store_uri(path)?;
+    store_uri(path)?;
     if path.exists() {
         if !replace {
             return Err(StoreError::Exists(path.to_path_buf()));
@@ -101,9 +104,57 @@ pub fn ingest(
                 path.display()
             )));
         }
-        std::fs::remove_file(path)?;
     }
+    // A fresh directory beside the store, created exclusively, holds the store while it is
+    // built, so no two ingests can share a temporary path; it is removed when dropped.
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let workspace = tempfile::Builder::new()
+        .prefix(".claim-graph-ingest-")
+        .tempdir_in(parent)?;
+    publish(
+        path,
+        &workspace.path().join("store.rl"),
+        draft_path,
+        draft,
+        log,
+    )
+}
 
+/// Build the store at `temporary`, then move it to `path`.
+fn publish(
+    path: &Path,
+    temporary: &Path,
+    draft_path: &str,
+    draft: &Draft,
+    log: &RunLog,
+) -> Result<IngestSummary, StoreError> {
+    if temporary.exists() {
+        // Someone else's file: report it and leave it alone.
+        return Err(StoreError::Exists(temporary.to_path_buf()));
+    }
+    let result = build(temporary, draft_path, draft, log).and_then(|summary| {
+        std::fs::rename(temporary, path)?;
+        Ok(summary)
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+fn build(
+    path: &Path,
+    draft_path: &str,
+    draft: &Draft,
+    log: &RunLog,
+) -> Result<IngestSummary, StoreError> {
+    let uri = store_uri(path)?;
+    if path.exists() {
+        return Err(StoreError::Exists(path.to_path_buf()));
+    }
     let rows = rows(draft_path, draft, log);
     let db = relate::Database::open(uri)?;
     let mut conn = db.connect()?;
@@ -303,4 +354,28 @@ fn dedup(items: &[String]) -> Vec<&String> {
         }
     }
     seen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::draft::parse_draft;
+    use crate::runlog::parse_run_log;
+
+    #[test]
+    fn a_failed_ingest_leaves_a_temporary_file_it_did_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.rl");
+        let temporary = dir.path().join(".claims.someone-else.rl");
+        std::fs::write(&temporary, b"another ingest's store").unwrap();
+        let draft = parse_draft(include_str!("../data/synthetic/draft.md")).unwrap();
+        let log = parse_run_log(include_str!("../data/synthetic/runs.jsonl")).unwrap();
+        let result = publish(&path, &temporary, "draft.md", &draft, &log);
+        assert!(matches!(result, Err(StoreError::Exists(_))));
+        assert_eq!(
+            std::fs::read(&temporary).unwrap(),
+            b"another ingest's store"
+        );
+        assert!(!path.exists());
+    }
 }

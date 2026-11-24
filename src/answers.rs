@@ -7,9 +7,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::queries;
-use crate::store::{
-    StoreError, float, int, open_read_only, params, string, string_list, unresolved,
-};
+use crate::store::{StoreError, float, int, open_read_only, params, string, string_list};
 
 /// A sentence, as listed in reports.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -35,20 +33,16 @@ pub fn unsupported(path: &Path) -> Result<Report, StoreError> {
     let mut conn = db.connect()?;
     let total = conn.query(queries::CLAIM_TOTAL)?;
     let total_claims = int(first(&total.rows, "claim total")?, "n")?;
-    let dangling = unresolved(&mut conn)?;
     let listed = |rows: &[Vec<relate::Value>]| -> Result<Vec<Listed>, StoreError> {
         rows.iter()
             .map(|row| {
-                let id = string(&row[0], "id")?;
+                let mut unresolved = string_list(&row[3], "unresolved")?;
+                unresolved.sort();
                 Ok(Listed {
-                    unresolved: dangling
-                        .iter()
-                        .filter(|(_, claim, _)| *claim == id)
-                        .map(|(_, _, r)| r.clone())
-                        .collect(),
-                    id,
+                    id: string(&row[0], "id")?,
                     section: string(&row[1], "section")?,
                     text: string(&row[2], "text")?,
+                    unresolved,
                 })
             })
             .collect()
@@ -65,6 +59,7 @@ pub fn unsupported(path: &Path) -> Result<Report, StoreError> {
 /// One reference a claim makes, and whether it supports the claim.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Link {
+    pub claim: String,
     pub kind: String,
     pub target: String,
     pub supports: bool,
@@ -95,6 +90,8 @@ pub struct Explanation {
     pub support_paths: Vec<Vec<String>>,
     pub stale: Vec<Stale>,
     pub figures: Vec<FigureTrace>,
+    /// Figures in this claim that its cited runs did not produce.
+    pub mismatches: Vec<Mismatch>,
 }
 
 pub fn explain(path: &Path, id: &str) -> Result<Explanation, StoreError> {
@@ -116,14 +113,13 @@ pub fn explain(path: &Path, id: &str) -> Result<Explanation, StoreError> {
         support_paths: Vec::new(),
         stale: Vec::new(),
         figures: Vec::new(),
+        mismatches: Vec::new(),
     };
     if !explanation.is_claim {
         return Ok(explanation);
     }
 
-    for row in &conn.query_with_params(queries::LINKS, by_id.clone())?.rows {
-        explanation.links.push(link(row)?);
-    }
+    explanation.links = links(&mut conn, Some(id), false)?;
     for row in &conn
         .query_with_params(queries::SUPPORT_PATHS, by_id.clone())?
         .rows
@@ -134,36 +130,54 @@ pub fn explain(path: &Path, id: &str) -> Result<Explanation, StoreError> {
     }
     explanation.stale = stale(&mut conn, Some(id))?;
     explanation.figures = traces(&mut conn, None, Some(id))?;
+    explanation.mismatches = mismatches(&mut conn, Some(id))?;
     Ok(explanation)
 }
 
-fn link(row: &[relate::Value]) -> Result<Link, StoreError> {
-    let kind = string(&row[0], "kind")?;
-    let target = string(&row[1], "target")?;
-    let listed = int(&row[2], "listed")? > 0;
-    let logged = row[3].as_bool().unwrap_or(true);
-    let status = row[4].as_string().map(str::to_string);
-    let runs = int(&row[5], "runs")?;
-    let completed = int(&row[6], "completed_runs")?;
-    let (supports, reason) = match kind.as_str() {
-        "source" if listed => (true, "listed in References".to_string()),
-        "source" => (false, "not listed in References".to_string()),
-        _ if !logged => (false, "not in the run log".to_string()),
-        "run" => match status.as_deref() {
-            Some("completed") => (true, "run completed".to_string()),
-            Some(other) => (false, format!("run status is {other}")),
-            None => (false, "run has no status".to_string()),
-        },
-        _ if runs == 0 => (false, "experiment has no runs".to_string()),
-        _ if completed == 0 => (false, format!("none of its {runs} runs completed")),
-        _ => (true, format!("{completed} of its {runs} runs completed")),
-    };
-    Ok(Link {
-        kind,
-        target,
-        supports,
-        reason,
-    })
+/// References of one claim, or with `broken_only` the references that fail on claims that
+/// are otherwise supported. Whether each supports, and why, is decided in the query.
+fn links(
+    conn: &mut relate::Connection,
+    id: Option<&str>,
+    broken_only: bool,
+) -> Result<Vec<Link>, StoreError> {
+    let result = conn.query_with_params(
+        queries::LINKS,
+        params(&json!({"id": id, "broken_only": broken_only}))?,
+    )?;
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            Ok(Link {
+                claim: string(&row[0], "claim")?,
+                kind: string(&row[1], "kind")?,
+                target: string(&row[2], "target")?,
+                supports: row[3]
+                    .as_bool()
+                    .ok_or_else(|| StoreError::Unexpected("column supports".into()))?,
+                reason: string(&row[4], "reason")?,
+            })
+        })
+        .collect()
+}
+
+fn mismatches(
+    conn: &mut relate::Connection,
+    id: Option<&str>,
+) -> Result<Vec<Mismatch>, StoreError> {
+    conn.query_with_params(queries::MISMATCHES, params(&json!({"id": id}))?)?
+        .rows
+        .iter()
+        .map(|row| {
+            Ok(Mismatch {
+                claim: string(&row[0], "claim")?,
+                figure: string(&row[1], "figure")?,
+                cited_results: string_list(&row[2], "cited_results")?,
+                stated_by: string_list(&row[3], "stated_by")?,
+            })
+        })
+        .collect()
 }
 
 fn stale(conn: &mut relate::Connection, id: Option<&str>) -> Result<Vec<Stale>, StoreError> {
@@ -226,6 +240,12 @@ pub fn trace(
 ) -> Result<Vec<FigureTrace>, StoreError> {
     let db = open_read_only(path)?;
     let mut conn = db.connect()?;
+    if let Some(id) = claim {
+        let found = conn.query_with_params(queries::SENTENCE, params(&json!({"id": id}))?)?;
+        if found.rows.is_empty() {
+            return Err(StoreError::UnknownSentence(id.to_string()));
+        }
+    }
     traces(&mut conn, figure, claim)
 }
 
@@ -298,13 +318,15 @@ pub struct Mismatch {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Audit {
     pub report: Report,
+    /// References that do not support a claim that is otherwise supported.
+    pub broken: Vec<Link>,
     pub stale: Vec<Stale>,
     pub mismatches: Vec<Mismatch>,
 }
 
 impl Audit {
     pub fn findings(&self) -> usize {
-        self.report.unsupported.len() + self.stale.len() + self.mismatches.len()
+        self.report.unsupported.len() + self.broken.len() + self.stale.len() + self.mismatches.len()
     }
 }
 
@@ -312,22 +334,12 @@ pub fn audit(path: &Path) -> Result<Audit, StoreError> {
     let report = unsupported(path)?;
     let db = open_read_only(path)?;
     let mut conn = db.connect()?;
+    let broken = links(&mut conn, None, true)?;
     let stale = stale(&mut conn, None)?;
-    let mismatches = conn
-        .query(queries::MISMATCHES)?
-        .rows
-        .iter()
-        .map(|row| {
-            Ok(Mismatch {
-                claim: string(&row[0], "claim")?,
-                figure: string(&row[1], "figure")?,
-                cited_results: string_list(&row[2], "cited_results")?,
-                stated_by: string_list(&row[3], "stated_by")?,
-            })
-        })
-        .collect::<Result<_, StoreError>>()?;
+    let mismatches = mismatches(&mut conn, None)?;
     Ok(Audit {
         report,
+        broken,
         stale,
         mismatches,
     })

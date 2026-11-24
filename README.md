@@ -11,7 +11,7 @@ The person who signs the paper has to catch these before a reviewer does.
 Claim Graph reads the draft (Markdown) and the agent's run log (JSON Lines) into one Relate graph and checks the claims against it.
 The relationships that carry the answer are:
 
-- claim to source (`CITES`), and draft to source (`LISTS`), so a citation counts only if the bibliography lists it;
+- claim to source (`CITES`), and draft to source (`LISTS`), so a citation counts only if the bibliography lists it, and a dangling citation is reported even when another reference supports the claim;
 - claim to run or experiment (`SUPPORTED_BY`), and experiment to run (`HAS_RUN`), so a claim counts as supported only through a completed run;
 - experiment to experiment (`SUPERSEDES`), followed to any depth, so a claim on a replaced pilot is flagged with the newest results;
 - claim to number (`STATES`), number to metric (`MATCHES`) or to a difference of two metrics (`DERIVED_AS`, `MINUEND`, `SUBTRAHEND`), and run to metric (`PRODUCED`), so every number in the text can be walked back to the run that produced it, or shown to have no source.
@@ -45,11 +45,11 @@ Relate capabilities used: embedded Rust API, single-file `.rl` store, explicit t
 
 ## Setup and run
 
-Prerequisites: Rust 1.88 or later with Cargo, and a network connection for the first build to fetch crates.
+Prerequisites: Rust 1.88 or later with Cargo (`rustup update` if Cargo reports an older compiler), and a network connection for the first build to fetch crates.
 The first build compiles the Relate engine from source and takes a few minutes.
 
 ```bash
-git clone <this repository> claim-graph && cd claim-graph
+git clone https://github.com/bananatruck/claim-graph.git claim-graph && cd claim-graph
 cargo build --release
 ```
 
@@ -73,6 +73,10 @@ C7  [Results]  A second seed confirms the result [run:m-99].
     unresolved: run:m-99
 C8  [Results]  Fig. 3 shows the error rate by notebook length.
 
+Broken references on otherwise supported claims
+
+C6 cites source ndiaye2022: not listed in References
+
 Claims on superseded experiments
 
 Stale: C5 rests on m-01, from experiment E10, which is superseded: E12 supersedes E11 supersedes E10
@@ -83,8 +87,10 @@ Figures the cited runs did not produce
 C1 states 74.2%, but its cited runs measured: m-07 accuracy = 0.739; m-07 tool_calls_per_question = 4.21
     the values those runs produced are stated by C3, C4
 
-4 findings.
+5 findings.
 ```
+
+`unsupported` is the structural check alone; `audit` is the full verdict, and the one to gate on.
 
 Explore the graph with any read-only Cypher, without installing anything else:
 
@@ -93,14 +99,15 @@ Explore the graph with any read-only Cypher, without installing anything else:
   "MATCH p = (:Experiment)-[:SUPERSEDES*]->(:Experiment) RETURN [n IN nodes(p) | n.id] AS chain"
 ```
 
-Rebuild a store from its inputs, or build one from your own draft and run log (formats in [SPEC.md](SPEC.md#inputs)):
+Build a store from the inputs, or from your own draft and run log (formats in [SPEC.md](SPEC.md#inputs)); `out/` is ignored by git, so the committed stores stay as they are:
 
 ```bash
-./target/release/claim-graph ingest --replace \
-  --draft data/synthetic/draft.md --runs data/synthetic/runs.jsonl --store store/claim-graph.rl
+mkdir -p out
+./target/release/claim-graph ingest \
+  --draft data/synthetic/draft.md --runs data/synthetic/runs.jsonl --store out/claim-graph.rl
 ```
 
-Other options: `--format json` on every reading command, `--prose` on `unsupported`, and `--fail` on `unsupported` and `audit` to exit with status 3 when there are findings, for use in a pipeline.
+Other options: `--format json` on `unsupported`, `explain`, `trace`, `audit` and `query`; `--prose` on `unsupported`; and `--fail` on `unsupported` and `audit` to exit with status 3 when there are findings, for use in a pipeline.
 `claim-graph --help` and `claim-graph <command> --help` list everything.
 Run the tests with `cargo test`.
 
@@ -116,10 +123,17 @@ The store is an ordinary Relate store, so the `relate` CLI should open it too (`
 
 ## Limits
 
-- Sentence splitting and the claim rule are deterministic heuristics; they over-report rather than miss (for example "Fig. 3 shows..." counts as a claim because it holds a number).
+- Sentence splitting and the claim rule are deterministic heuristics, not language understanding; they lean towards checking too much (for example "Fig. 3 shows..." counts as a claim because it holds a number).
+- A sentence with no number, no reference and no word from the comparison list in `src/classify.rs` is prose and is not checked.
+- Table rows, images and code are skipped, so a result stated only in a table is not checked.
 - Only `[@key]`, `[run:ID]` and `[exp:ID]` references are recognised.
-- Numbers match by value and written precision, so an unrelated metric with the same value can match; `trace` shows every match.
-- Bare integers are treated as counts and never matched to metrics.
+- Numbers match by value and written precision, so an unrelated metric with the same value can match; `trace` shows every match, with the run's status and whether the claim cites it.
+- Bare integers are treated as counts and never matched to metrics, and unit suffixes such as `k` or `ms` are kept in the text but not used to rescale the number.
+- A claim that cites several runs is checked against all of them together: which number in the sentence belongs to which run is not parsed.
+- Numbers in a claim supported only by citations are not checked, since the cited work is not in the graph.
+- A difference is recognised only between two completed runs of one experiment the claim rests on.
+- Most checks follow paths of one or two hops; the unbounded traversal is the `SUPERSEDES` chain, and number matching compares every figure with every metric, which is fine for one paper and its log.
+- A store holds one draft and is rebuilt on every ingest.
 - Claim Graph does not judge whether a source says what the claim says.
 
 ## Licence
