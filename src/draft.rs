@@ -474,7 +474,7 @@ enum Kind {
     Experiment,
 }
 
-fn is_identifier(text: &str) -> bool {
+pub(crate) fn is_identifier(text: &str) -> bool {
     !text.is_empty()
         && text
             .chars()

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use serde::Deserialize;
 
-use crate::draft::ParseError;
+use crate::draft::{ParseError, is_identifier};
 
 /// Everything a run log records, in file order.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -86,6 +86,7 @@ pub fn parse_run_log(input: &str) -> Result<RunLog, ParseError> {
                 name,
                 supersedes,
             } => {
+                check_id(&id, line)?;
                 if !experiment_ids.insert(id.clone()) {
                     return Err(fail(format!("experiment `{id}` is defined twice")));
                 }
@@ -102,6 +103,7 @@ pub fn parse_run_log(input: &str) -> Result<RunLog, ParseError> {
                 seed,
                 status,
             } => {
+                check_id(&id, line)?;
                 if !run_ids.insert(id.clone()) {
                     return Err(fail(format!("run `{id}` is defined twice")));
                 }
@@ -135,6 +137,12 @@ pub fn parse_run_log(input: &str) -> Result<RunLog, ParseError> {
             });
         }
     }
+    if let Some(line) = supersedes_cycle(&log.experiments, &experiment_lines) {
+        return Err(ParseError {
+            line,
+            message: "experiments supersede each other in a cycle".to_string(),
+        });
+    }
     for (run, &line) in log.runs.iter().zip(&run_lines) {
         if !experiment_ids.contains(&run.experiment) {
             return Err(ParseError {
@@ -158,6 +166,43 @@ pub fn parse_run_log(input: &str) -> Result<RunLog, ParseError> {
         }
     }
     Ok(log)
+}
+
+/// Run and experiment IDs must be ones a draft can write as `[run:ID]` or `[exp:ID]`.
+fn check_id(id: &str, line: usize) -> Result<(), ParseError> {
+    if is_identifier(id) {
+        Ok(())
+    } else {
+        Err(ParseError {
+            line,
+            message: format!(
+                "ID `{id}` must be letters, digits, `-`, `_`, `.` or `:`, so a draft can reference it"
+            ),
+        })
+    }
+}
+
+/// The line of an experiment on a `supersedes` cycle, if there is one.
+/// Each experiment supersedes at most one other, so following the links from any start
+/// either ends or comes back to an experiment already seen on that walk.
+fn supersedes_cycle(experiments: &[Experiment], lines: &[usize]) -> Option<usize> {
+    let index_of = |id: &str| experiments.iter().position(|e| e.id == id);
+    for start in 0..experiments.len() {
+        let mut seen = vec![start];
+        let mut current = start;
+        while let Some(next) = experiments[current]
+            .supersedes
+            .as_deref()
+            .and_then(index_of)
+        {
+            if seen.contains(&next) {
+                return Some(lines[next]);
+            }
+            seen.push(next);
+            current = next;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -246,6 +291,28 @@ mod tests {
                 "{\"kind\":\"experiment\",\"id\":\"E2\",\"name\":\"b\",\"supersedes\":\"E2\"}\n"
             ),
             1
+        );
+    }
+
+    #[test]
+    fn a_supersedes_cycle_is_an_error() {
+        let input = "{\"kind\":\"experiment\",\"id\":\"E12\",\"name\":\"c\",\"supersedes\":\"E11\"}\n{\"kind\":\"experiment\",\"id\":\"E11\",\"name\":\"b\",\"supersedes\":\"E10\"}\n{\"kind\":\"experiment\",\"id\":\"E10\",\"name\":\"a\",\"supersedes\":\"E12\"}\n";
+        let err = parse_run_log(input).unwrap_err();
+        assert!(err.message.contains("cycle"), "{}", err.message);
+        assert!((1..=3).contains(&err.line));
+    }
+
+    #[test]
+    fn ids_the_draft_cannot_reference_are_an_error() {
+        assert_eq!(
+            error_line("{\"kind\":\"experiment\",\"id\":\"exp/1\",\"name\":\"slash\"}\n"),
+            1
+        );
+        assert_eq!(
+            error_line(
+                "{\"kind\":\"experiment\",\"id\":\"E1\",\"name\":\"a\"}\n{\"kind\":\"run\",\"id\":\"\",\"experiment\":\"E1\",\"status\":\"completed\"}\n"
+            ),
+            2
         );
     }
 
