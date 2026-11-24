@@ -146,6 +146,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "relate",
+ "relate-storage",
  "serde",
  "serde_json",
  "tempfile",

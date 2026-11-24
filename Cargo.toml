@@ -14,4 +14,5 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 
 [dev-dependencies]
+relate-storage = { version = "=1.2.0", default-features = false }
 tempfile = "3.27.0"

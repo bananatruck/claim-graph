@@ -1,40 +1,32 @@
-//! Writes a parsed draft and run log into a single-file Relate store, and queries it.
+//! Writes a parsed draft and run log into a single-file Relate store.
 //!
-//! See SPEC.md, sections "Graph model" and "Queries".
+//! See SPEC.md, section "Graph model". The questions asked of the store are in `answers`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use serde_json::{Value as Json, json};
+
 use crate::draft::Draft;
+use crate::queries;
 use crate::runlog::RunLog;
 
-/// What `ingest` wrote.
-#[derive(Debug, Clone, PartialEq)]
+/// What `ingest` wrote, counted from the graph after the commit.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct IngestSummary {
-    pub claims: usize,
-    pub sources: usize,
-    pub experiments: usize,
-    pub runs: usize,
-    pub metrics: usize,
+    pub claims: i64,
+    pub prose: i64,
+    pub sources: i64,
+    pub experiments: i64,
+    pub runs: i64,
+    pub metrics: i64,
+    pub figures: i64,
+    pub matches: i64,
+    pub derivations: i64,
     /// `(claim id, reference)` for each reference that points at nothing,
-    /// written as `@key`, `run:ID` or `exp:ID`.
+    /// written as `@key`, `run:ID` or `exp:ID`, in reading order.
     pub unresolved: Vec<(String, String)>,
-}
-
-/// A claim with no path to a completed run or a listed source.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct UnsupportedClaim {
-    pub id: String,
-    pub section: String,
-    pub text: String,
-    pub unresolved: Vec<String>,
-}
-
-/// The answer to "which claims are unsupported", read from the store.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct Report {
-    pub total_claims: usize,
-    pub unsupported: Vec<UnsupportedClaim>,
 }
 
 #[derive(Debug)]
@@ -43,8 +35,12 @@ pub enum StoreError {
     NotSingleFile(PathBuf),
     /// The store already exists and `replace` was not set.
     Exists(PathBuf),
+    /// There is no store at the path.
+    Missing(PathBuf),
     /// The path is not valid UTF-8, which Relate's open call needs.
     NotUtf8(PathBuf),
+    /// No sentence has the requested ID.
+    UnknownSentence(String),
     Io(std::io::Error),
     Relate(relate::Error),
     /// The store answered with a shape this program does not expect.
@@ -62,7 +58,9 @@ impl fmt::Display for StoreError {
                 "store already exists: {} (pass --replace to rebuild it)",
                 p.display()
             ),
+            StoreError::Missing(p) => write!(f, "no store at {}", p.display()),
             StoreError::NotUtf8(p) => write!(f, "store path is not valid UTF-8: {}", p.display()),
+            StoreError::UnknownSentence(id) => write!(f, "no sentence with ID {id} in the store"),
             StoreError::Io(e) => write!(f, "{e}"),
             StoreError::Relate(e) => write!(f, "relate: {e}"),
             StoreError::Unexpected(m) => write!(f, "unexpected result from the store: {m}"),
@@ -83,64 +81,6 @@ impl From<std::io::Error> for StoreError {
         StoreError::Io(e)
     }
 }
-
-/// The unsupported-claims query from SPEC.md, verbatim.
-pub const UNSUPPORTED_QUERY: &str = "\
-MATCH (c:Claim)
-WHERE NOT EXISTS {
-  MATCH (c)-[:CITES|SUPPORTED_BY|HAS_RUN*1..2]->(t)
-  WHERE t:Source OR (t:Run AND t.status = 'completed')
-}
-RETURN c.id AS id, c.section AS section, c.text AS text, c.unresolved AS unresolved
-ORDER BY c.ordinal";
-
-/// Each write statement and the parameter it reads its rows from.
-const WRITES: &[(&str, &str)] = &[
-    (
-        "draft",
-        "CREATE (:Draft {path: $draft.path, title: $draft.title})",
-    ),
-    (
-        "sources",
-        "MATCH (d:Draft) UNWIND $sources AS s \
-         CREATE (d)-[:LISTS]->(:Source {key: s.key, entry: s.entry})",
-    ),
-    (
-        "experiments",
-        "UNWIND $experiments AS e CREATE (:Experiment {id: e.id, name: e.name})",
-    ),
-    (
-        "runs",
-        "UNWIND $runs AS r MATCH (e:Experiment {id: r.experiment}) \
-         CREATE (e)-[:HAS_RUN]->(:Run {id: r.id, seed: r.seed, status: r.status})",
-    ),
-    (
-        "metrics",
-        "UNWIND $metrics AS m MATCH (r:Run {id: m.run}) \
-         CREATE (r)-[:PRODUCED]->(:Metric {run: m.run, name: m.name, value: m.value})",
-    ),
-    (
-        "claims",
-        "MATCH (d:Draft) UNWIND $claims AS c \
-         CREATE (d)-[:HAS_CLAIM]->(:Claim {id: c.id, ordinal: c.ordinal, section: c.section, \
-         text: c.text, unresolved: c.unresolved})",
-    ),
-    (
-        "cites",
-        "UNWIND $cites AS x MATCH (c:Claim {id: x.claim}), (s:Source {key: x.key}) \
-         CREATE (c)-[:CITES]->(s)",
-    ),
-    (
-        "run_links",
-        "UNWIND $run_links AS x MATCH (c:Claim {id: x.claim}), (r:Run {id: x.id}) \
-         CREATE (c)-[:SUPPORTED_BY]->(r)",
-    ),
-    (
-        "experiment_links",
-        "UNWIND $experiment_links AS x MATCH (c:Claim {id: x.claim}), (e:Experiment {id: x.id}) \
-         CREATE (c)-[:SUPPORTED_BY]->(e)",
-    ),
-];
 
 /// Build the graph in a new store at `path`, in one transaction, then checkpoint and close it.
 pub fn ingest(
@@ -164,73 +104,78 @@ pub fn ingest(
         std::fs::remove_file(path)?;
     }
 
-    let rows = Rows::new(draft_path, draft, log);
+    let rows = rows(draft_path, draft, log);
     let db = relate::Database::open(uri)?;
     let mut conn = db.connect()?;
     conn.begin()?;
-    for (name, statement) in WRITES {
-        let params = rows.params(name)?;
+    for (statement, param) in queries::WRITES {
+        let params = match param {
+            Some(name) => params(&json!({ *name: rows[*name] }))?,
+            None => BTreeMap::new(),
+        };
         if let Err(e) = conn.query_with_params(statement, params) {
             conn.rollback()?;
             return Err(e.into());
         }
     }
     conn.commit()?;
+
+    let counts = conn.query(queries::COUNTS)?;
+    let row = counts
+        .rows
+        .first()
+        .ok_or_else(|| StoreError::Unexpected("counts".into()))?;
+    let count = |i: usize| -> Result<i64, StoreError> {
+        row.get(i)
+            .and_then(relate::Value::as_int)
+            .ok_or_else(|| StoreError::Unexpected(format!("count column {i}")))
+    };
+    let mut summary = IngestSummary {
+        claims: count(0)?,
+        prose: count(1)?,
+        sources: count(2)?,
+        experiments: count(3)?,
+        runs: count(4)?,
+        metrics: count(5)?,
+        figures: count(6)?,
+        matches: count(7)?,
+        derivations: count(8)?,
+        unresolved: Vec::new(),
+    };
+    summary.unresolved = unresolved(&mut conn)?
+        .into_iter()
+        .map(|(_, claim, reference)| (claim, reference))
+        .collect();
     drop(conn);
     db.checkpoint()?;
     drop(db);
-
-    Ok(IngestSummary {
-        claims: draft.claims.len(),
-        sources: draft.sources.len(),
-        experiments: log.experiments.len(),
-        runs: log.runs.len(),
-        metrics: log.metrics.len(),
-        unresolved: rows.unresolved,
-    })
+    Ok(summary)
 }
 
-/// Open the store read-only and list the claims with no supporting path.
-pub fn unsupported(path: &Path) -> Result<Report, StoreError> {
+/// `(ordinal, claim id, reference)` for every dangling reference, in reading order.
+pub(crate) fn unresolved(
+    conn: &mut relate::Connection,
+) -> Result<Vec<(i64, String, String)>, StoreError> {
+    let result = conn.query(queries::UNRESOLVED)?;
+    let mut out = Vec::new();
+    for row in &result.rows {
+        out.push((
+            int(&row[0], "ordinal")?,
+            string(&row[1], "claim")?,
+            string(&row[2], "ref")?,
+        ));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Open an existing store read-only.
+pub fn open_read_only(path: &Path) -> Result<relate::Database, StoreError> {
     let uri = store_uri(path)?;
     if !path.is_file() {
-        return Err(StoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("no store at {}", path.display()),
-        )));
+        return Err(StoreError::Missing(path.to_path_buf()));
     }
-    let db = relate::Database::open_read_only(uri)?;
-    let mut conn = db.connect()?;
-
-    let total = conn.query("MATCH (c:Claim) RETURN count(c) AS n")?;
-    let total_claims = total
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .and_then(relate::Value::as_int)
-        .ok_or_else(|| StoreError::Unexpected("claim count".into()))?;
-
-    let result = conn.query(UNSUPPORTED_QUERY)?;
-    let mut unsupported = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
-        let [id, section, text, unresolved] = row.as_slice() else {
-            return Err(StoreError::Unexpected(format!(
-                "expected 4 columns, got {}",
-                row.len()
-            )));
-        };
-        unsupported.push(UnsupportedClaim {
-            id: string(id, "id")?,
-            section: string(section, "section")?,
-            text: string(text, "text")?,
-            unresolved: string_list(unresolved)?,
-        });
-    }
-    Ok(Report {
-        total_claims: usize::try_from(total_claims)
-            .map_err(|_| StoreError::Unexpected(format!("claim count {total_claims}")))?,
-        unsupported,
-    })
+    Ok(relate::Database::open_read_only(uri)?)
 }
 
 fn store_uri(path: &Path) -> Result<&str, StoreError> {
@@ -241,104 +186,121 @@ fn store_uri(path: &Path) -> Result<&str, StoreError> {
         .ok_or_else(|| StoreError::NotUtf8(path.to_path_buf()))
 }
 
-fn string(value: &relate::Value, column: &str) -> Result<String, StoreError> {
+pub(crate) fn params(value: &Json) -> Result<BTreeMap<String, relate::Value>, StoreError> {
+    relate::params_from_value(value).map_err(StoreError::Unexpected)
+}
+
+pub(crate) fn string(value: &relate::Value, column: &str) -> Result<String, StoreError> {
     value
         .as_string()
         .map(str::to_string)
         .ok_or_else(|| StoreError::Unexpected(format!("column {column} is not a string")))
 }
 
-fn string_list(value: &relate::Value) -> Result<Vec<String>, StoreError> {
+pub(crate) fn int(value: &relate::Value, column: &str) -> Result<i64, StoreError> {
+    value
+        .as_int()
+        .ok_or_else(|| StoreError::Unexpected(format!("column {column} is not an integer")))
+}
+
+pub(crate) fn float(value: &relate::Value, column: &str) -> Result<f64, StoreError> {
+    match value {
+        relate::Value::Float(f) => Ok(*f),
+        relate::Value::Int(i) => Ok(*i as f64),
+        _ => Err(StoreError::Unexpected(format!(
+            "column {column} is not a number"
+        ))),
+    }
+}
+
+pub(crate) fn string_list(value: &relate::Value, column: &str) -> Result<Vec<String>, StoreError> {
     match value {
         relate::Value::Null => Ok(Vec::new()),
-        relate::Value::List(items) => items
-            .iter()
-            .map(|item| string(item, "unresolved"))
-            .collect(),
-        _ => Err(StoreError::Unexpected(
-            "column unresolved is not a list".into(),
-        )),
+        relate::Value::List(items) => items.iter().map(|item| string(item, column)).collect(),
+        _ => Err(StoreError::Unexpected(format!(
+            "column {column} is not a list"
+        ))),
     }
 }
 
-/// The parameter rows for every write, plus the references that resolve to nothing.
-struct Rows {
-    params: serde_json::Value,
-    unresolved: Vec<(String, String)>,
-}
-
-impl Rows {
-    fn new(draft_path: &str, draft: &Draft, log: &RunLog) -> Self {
-        use serde_json::json;
-        use std::collections::HashSet;
-
-        let source_keys: HashSet<&str> = draft.sources.iter().map(|s| s.key.as_str()).collect();
-        let run_ids: HashSet<&str> = log.runs.iter().map(|r| r.id.as_str()).collect();
-        let experiment_ids: HashSet<&str> = log.experiments.iter().map(|e| e.id.as_str()).collect();
-
-        let mut unresolved = Vec::new();
-        let mut claims = Vec::new();
-        let mut cites = Vec::new();
-        let mut run_links = Vec::new();
-        let mut experiment_links = Vec::new();
-        for claim in &draft.claims {
-            let mut missing = Vec::new();
-            for key in &claim.citations {
-                if source_keys.contains(key.as_str()) {
-                    cites.push(json!({"claim": claim.id, "key": key}));
-                } else {
-                    missing.push(format!("@{key}"));
-                }
-            }
-            for id in &claim.runs {
-                if run_ids.contains(id.as_str()) {
-                    run_links.push(json!({"claim": claim.id, "id": id}));
-                } else {
-                    missing.push(format!("run:{id}"));
-                }
-            }
-            for id in &claim.experiments {
-                if experiment_ids.contains(id.as_str()) {
-                    experiment_links.push(json!({"claim": claim.id, "id": id}));
-                } else {
-                    missing.push(format!("exp:{id}"));
-                }
-            }
-            unresolved.extend(missing.iter().map(|m| (claim.id.clone(), m.clone())));
-            claims.push(json!({
-                "id": claim.id,
-                "ordinal": claim.ordinal,
-                "section": claim.section,
-                "text": claim.text,
-                "unresolved": missing,
+/// The parameter rows for every write. References are passed as written; whether they
+/// resolve is decided by the graph, not here.
+fn rows(draft_path: &str, draft: &Draft, log: &RunLog) -> Json {
+    let mut claims = Vec::new();
+    let mut prose = Vec::new();
+    let mut cites = Vec::new();
+    let mut run_links = Vec::new();
+    let mut experiment_links = Vec::new();
+    let mut figures = Vec::new();
+    for sentence in &draft.sentences {
+        let row = json!({
+            "id": sentence.id,
+            "ordinal": sentence.ordinal,
+            "section": sentence.section,
+            "text": sentence.text,
+            "reasons": sentence.reasons.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+        });
+        if !sentence.is_claim() {
+            prose.push(row);
+            continue;
+        }
+        claims.push(row);
+        for key in dedup(&sentence.citations) {
+            cites.push(json!({"claim": sentence.id, "key": key}));
+        }
+        for id in dedup(&sentence.runs) {
+            run_links.push(json!({"claim": sentence.id, "id": id}));
+        }
+        for id in dedup(&sentence.experiments) {
+            experiment_links.push(json!({"claim": sentence.id, "id": id}));
+        }
+        for (index, figure) in sentence.figures.iter().enumerate() {
+            // Only percentages and numbers written with decimals are treated as
+            // measurements; bare integers are usually counts ("3 seeds", "2024").
+            let measured = figure.percent || figure.as_written.contains('.');
+            figures.push(json!({
+                "claim": sentence.id,
+                "index": index,
+                "as_written": figure.as_written,
+                "value": figure.value,
+                "tolerance": figure.tolerance,
+                "raw": figure.raw,
+                "raw_tolerance": figure.raw_tolerance,
+                "percent": figure.percent,
+                "measured": measured,
             }));
         }
-
-        let params = json!({
-            "draft": {"path": draft_path, "title": draft.title},
-            "sources": draft.sources.iter()
-                .map(|s| json!({"key": s.key, "entry": s.entry})).collect::<Vec<_>>(),
-            "experiments": log.experiments.iter()
-                .map(|e| json!({"id": e.id, "name": e.name})).collect::<Vec<_>>(),
-            "runs": log.runs.iter()
-                .map(|r| json!({"id": r.id, "experiment": r.experiment, "seed": r.seed, "status": r.status}))
-                .collect::<Vec<_>>(),
-            "metrics": log.metrics.iter()
-                .map(|m| json!({"run": m.run, "name": m.name, "value": m.value})).collect::<Vec<_>>(),
-            "claims": claims,
-            "cites": cites,
-            "run_links": run_links,
-            "experiment_links": experiment_links,
-        });
-        Rows { params, unresolved }
     }
 
-    /// Parameters for one write: only the named row set, bound under its own name.
-    fn params(
-        &self,
-        name: &str,
-    ) -> Result<std::collections::BTreeMap<String, relate::Value>, StoreError> {
-        let value = serde_json::json!({ name: self.params[name] });
-        relate::params_from_value(&value).map_err(StoreError::Unexpected)
+    json!({
+        "draft": {"path": draft_path, "title": draft.title},
+        "sources": draft.sources.iter()
+            .map(|s| json!({"key": s.key, "entry": s.entry})).collect::<Vec<_>>(),
+        "experiments": log.experiments.iter()
+            .map(|e| json!({"id": e.id, "name": e.name})).collect::<Vec<_>>(),
+        "supersedes": log.experiments.iter()
+            .filter_map(|e| e.supersedes.as_ref().map(|older| json!({"newer": e.id, "older": older})))
+            .collect::<Vec<_>>(),
+        "runs": log.runs.iter()
+            .map(|r| json!({"id": r.id, "experiment": r.experiment, "seed": r.seed, "status": r.status}))
+            .collect::<Vec<_>>(),
+        "metrics": log.metrics.iter()
+            .map(|m| json!({"run": m.run, "name": m.name, "value": m.value})).collect::<Vec<_>>(),
+        "claims": claims,
+        "prose": prose,
+        "cites": cites,
+        "run_links": run_links,
+        "experiment_links": experiment_links,
+        "figures": figures,
+    })
+}
+
+fn dedup(items: &[String]) -> Vec<&String> {
+    let mut seen = Vec::new();
+    for item in items {
+        if !seen.contains(&item) {
+            seen.push(item);
+        }
     }
+    seen
 }
