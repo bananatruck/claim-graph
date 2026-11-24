@@ -1,6 +1,7 @@
-//! Strict parser for a run log in JSON Lines.
+//! Parser for a run log in JSON Lines.
 //!
 //! See SPEC.md, section "Run log (JSON Lines)", for the input contract.
+//! Required fields are checked strictly; extra fields, which real loggers add, are ignored.
 
 use std::collections::HashSet;
 
@@ -20,6 +21,8 @@ pub struct RunLog {
 pub struct Experiment {
     pub id: String,
     pub name: String,
+    /// The experiment this one replaces, if any.
+    pub supersedes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,11 +42,12 @@ pub struct Metric {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 enum Record {
     Experiment {
         id: String,
         name: String,
+        supersedes: Option<String>,
     },
     Run {
         id: String,
@@ -56,17 +60,19 @@ enum Record {
         name: String,
         value: f64,
     },
-    Note {
-        #[allow(dead_code)]
-        text: String,
-    },
+    Note {},
 }
 
-/// Parse a run log. Runs must follow their experiment and metrics must follow their run.
+/// Parse a run log. Records may come in any order; references between them are checked
+/// after the whole file is read, and errors name the line of the record that refers.
 pub fn parse_run_log(input: &str) -> Result<RunLog, ParseError> {
     let mut log = RunLog::default();
+    let mut experiment_lines = Vec::new();
+    let mut run_lines = Vec::new();
+    let mut metric_lines = Vec::new();
     let mut experiment_ids = HashSet::new();
     let mut run_ids = HashSet::new();
+
     for (index, raw) in input.lines().enumerate() {
         let line = index + 1;
         if raw.trim().is_empty() {
@@ -75,11 +81,20 @@ pub fn parse_run_log(input: &str) -> Result<RunLog, ParseError> {
         let fail = |message: String| ParseError { line, message };
         let record: Record = serde_json::from_str(raw).map_err(|e| fail(e.to_string()))?;
         match record {
-            Record::Experiment { id, name } => {
+            Record::Experiment {
+                id,
+                name,
+                supersedes,
+            } => {
                 if !experiment_ids.insert(id.clone()) {
                     return Err(fail(format!("experiment `{id}` is defined twice")));
                 }
-                log.experiments.push(Experiment { id, name });
+                experiment_lines.push(line);
+                log.experiments.push(Experiment {
+                    id,
+                    name,
+                    supersedes,
+                });
             }
             Record::Run {
                 id,
@@ -87,14 +102,10 @@ pub fn parse_run_log(input: &str) -> Result<RunLog, ParseError> {
                 seed,
                 status,
             } => {
-                if !experiment_ids.contains(&experiment) {
-                    return Err(fail(format!(
-                        "run `{id}` names experiment `{experiment}`, which is not defined above it"
-                    )));
-                }
                 if !run_ids.insert(id.clone()) {
                     return Err(fail(format!("run `{id}` is defined twice")));
                 }
+                run_lines.push(line);
                 log.runs.push(Run {
                     id,
                     experiment,
@@ -103,14 +114,47 @@ pub fn parse_run_log(input: &str) -> Result<RunLog, ParseError> {
                 });
             }
             Record::Metric { run, name, value } => {
-                if !run_ids.contains(&run) {
-                    return Err(fail(format!(
-                        "metric `{name}` names run `{run}`, which is not defined above it"
-                    )));
-                }
+                metric_lines.push(line);
                 log.metrics.push(Metric { run, name, value });
             }
-            Record::Note { .. } => {}
+            Record::Note {} => {}
+        }
+    }
+
+    for (experiment, &line) in log.experiments.iter().zip(&experiment_lines) {
+        let Some(older) = &experiment.supersedes else {
+            continue;
+        };
+        if older == &experiment.id || !experiment_ids.contains(older) {
+            return Err(ParseError {
+                line,
+                message: format!(
+                    "experiment `{}` supersedes `{older}`, which is not another defined experiment",
+                    experiment.id
+                ),
+            });
+        }
+    }
+    for (run, &line) in log.runs.iter().zip(&run_lines) {
+        if !experiment_ids.contains(&run.experiment) {
+            return Err(ParseError {
+                line,
+                message: format!(
+                    "run `{}` names experiment `{}`, which is not defined",
+                    run.id, run.experiment
+                ),
+            });
+        }
+    }
+    for (metric, &line) in log.metrics.iter().zip(&metric_lines) {
+        if !run_ids.contains(&metric.run) {
+            return Err(ParseError {
+                line,
+                message: format!(
+                    "metric `{}` names run `{}`, which is not defined",
+                    metric.name, metric.run
+                ),
+            });
         }
     }
     Ok(log)
@@ -135,7 +179,8 @@ mod tests {
             log.experiments,
             [Experiment {
                 id: "E1".into(),
-                name: "first".into()
+                name: "first".into(),
+                supersedes: None,
             }]
         );
         assert_eq!(log.runs.len(), 2);
@@ -162,9 +207,44 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_field_is_an_error() {
+    fn unknown_fields_are_ignored() {
+        let log = parse_run_log(
+            "{\"kind\":\"experiment\",\"id\":\"E1\",\"name\":\"a\",\"git_sha\":\"abc\"}\n",
+        )
+        .unwrap();
+        assert_eq!(log.experiments[0].id, "E1");
+    }
+
+    #[test]
+    fn records_may_come_in_any_order() {
+        let input = "{\"kind\":\"metric\",\"run\":\"r\",\"name\":\"m\",\"value\":1.0}\n{\"kind\":\"run\",\"id\":\"r\",\"experiment\":\"E1\",\"status\":\"completed\"}\n{\"kind\":\"experiment\",\"id\":\"E1\",\"name\":\"a\"}\n";
+        let log = parse_run_log(input).unwrap();
         assert_eq!(
-            error_line("{\"kind\":\"experiment\",\"id\":\"E1\",\"name\":\"a\",\"nmae\":\"b\"}\n"),
+            (log.experiments.len(), log.runs.len(), log.metrics.len()),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn supersedes_links_two_experiments() {
+        let input = "{\"kind\":\"experiment\",\"id\":\"E2\",\"name\":\"b\",\"supersedes\":\"E1\"}\n{\"kind\":\"experiment\",\"id\":\"E1\",\"name\":\"a\"}\n";
+        let log = parse_run_log(input).unwrap();
+        assert_eq!(log.experiments[0].supersedes.as_deref(), Some("E1"));
+        assert_eq!(log.experiments[1].supersedes, None);
+    }
+
+    #[test]
+    fn supersedes_must_name_another_defined_experiment() {
+        assert_eq!(
+            error_line(
+                "{\"kind\":\"experiment\",\"id\":\"E2\",\"name\":\"b\",\"supersedes\":\"E9\"}\n"
+            ),
+            1
+        );
+        assert_eq!(
+            error_line(
+                "{\"kind\":\"experiment\",\"id\":\"E2\",\"name\":\"b\",\"supersedes\":\"E2\"}\n"
+            ),
             1
         );
     }
