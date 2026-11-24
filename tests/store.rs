@@ -155,7 +155,8 @@ fn the_report_follows_edits_made_to_the_graph() {
 #[test]
 fn explain_gives_the_reason_for_each_reference() {
     let (_dir, path) = built(&CLEAN);
-    let link = |kind: &str, target: &str, supports: bool, reason: &str| Link {
+    let link = |claim: &str, kind: &str, target: &str, supports: bool, reason: &str| Link {
+        claim: claim.into(),
         kind: kind.into(),
         target: target.into(),
         supports,
@@ -166,20 +167,27 @@ fn explain_gives_the_reason_for_each_reference() {
     assert!(c4.is_claim);
     assert_eq!(
         c4.links,
-        [link("experiment", "E2", false, "experiment has no runs")]
+        [link(
+            "C4",
+            "experiment",
+            "E2",
+            false,
+            "experiment has no runs"
+        )]
     );
     assert!(c4.support_paths.is_empty());
 
     let c6 = answers::explain(&path, "C6").unwrap();
     assert_eq!(
         c6.links,
-        [link("run", "r-004", false, "run status is failed")]
+        [link("C6", "run", "r-004", false, "run status is failed")]
     );
 
     let c7 = answers::explain(&path, "C7").unwrap();
     assert_eq!(
         c7.links,
         [link(
+            "C7",
             "source",
             "okafor2023",
             false,
@@ -190,7 +198,13 @@ fn explain_gives_the_reason_for_each_reference() {
     let c2 = answers::explain(&path, "C2").unwrap();
     assert_eq!(
         c2.links,
-        [link("experiment", "E1", true, "3 of its 3 runs completed")]
+        [link(
+            "C2",
+            "experiment",
+            "E1",
+            true,
+            "3 of its 3 runs completed"
+        )]
     );
     assert_eq!(
         c2.support_paths,
@@ -333,7 +347,8 @@ fn two_claims_citing_one_run_with_different_values_are_a_mismatch() {
             stated_by: strings(&["C3", "C4"]),
         }]
     );
-    assert_eq!(audit.findings(), 4);
+    // 2 unsupported, 1 broken reference, 1 stale, 1 mismatch.
+    assert_eq!(audit.findings(), 5);
 }
 
 #[test]
@@ -421,4 +436,195 @@ fn the_committed_store_is_a_single_file_bundle_with_the_json_codec() {
         }
         other => panic!("expected a JSON snapshot, found {other:?}"),
     }
+}
+
+// Review round 1: trigger inputs from outside review, pinned as tests.
+
+fn built_from(draft: &str, runs: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("claims.rl");
+    let draft = parse_draft(draft).unwrap();
+    let log = parse_run_log(runs).unwrap();
+    store::ingest(&path, "draft.md", &draft, &log, false).unwrap();
+    (dir, path)
+}
+
+fn mismatched(path: &Path) -> Vec<(String, String)> {
+    answers::audit(path)
+        .unwrap()
+        .mismatches
+        .into_iter()
+        .map(|m| (m.claim, m.figure))
+        .collect()
+}
+
+fn pair(claim: &str, figure: &str) -> (String, String) {
+    (claim.to_string(), figure.to_string())
+}
+
+const E1_RUNS: &str = r#"{"kind":"experiment","id":"E1","name":"a"}
+{"kind":"run","id":"r-1","experiment":"E1","status":"completed"}
+{"kind":"run","id":"r-2","experiment":"E1","status":"completed"}
+"#;
+
+#[test]
+fn an_uncited_direct_match_does_not_hide_a_cited_difference() {
+    let runs = format!(
+        "{}\n{}",
+        CLEAN.runs,
+        r#"{"kind":"experiment","id":"E9","name":"other"}
+{"kind":"run","id":"r-999","experiment":"E9","status":"failed"}
+{"kind":"metric","run":"r-999","name":"tool_calls","value":6.1}"#
+    );
+    let (_dir, path) = built_from(CLEAN.draft, &runs);
+    assert!(mismatched(&path).is_empty());
+    let traces = answers::trace(&path, Some("6.1"), None).unwrap();
+    assert_eq!(traces[0].differences[0].minuend_run, "r-002");
+    assert!(traces[0].differences[0].cited);
+}
+
+#[test]
+fn a_difference_needs_both_runs_completed() {
+    let runs = MESSY.runs.replace(
+        r#""id":"m-06","experiment":"E12","seed":1,"status":"completed""#,
+        r#""id":"m-06","experiment":"E12","seed":1,"status":"crashed""#,
+    );
+    let (_dir, path) = built_from(MESSY.draft, &runs);
+    assert!(mismatched(&path).contains(&pair("C2", "4.4")));
+}
+
+#[test]
+fn a_difference_needs_both_runs_cited() {
+    let draft = MESSY.draft.replace(
+        "over the plain agent [exp:E12]",
+        "over the plain agent [run:m-07]",
+    );
+    let (_dir, path) = built_from(&draft, MESSY.runs);
+    assert!(mismatched(&path).contains(&pair("C2", "4.4")));
+    let traces = answers::trace(&path, Some("4.4"), None).unwrap();
+    assert!(traces[0].differences.iter().all(|d| !d.cited));
+}
+
+#[test]
+fn signs_are_checked() {
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"loss_delta","value":-0.713}
+{"kind":"metric","run":"r-2","name":"accuracy","value":0.739}
+"#
+    );
+    let draft =
+        "The loss delta is -0.713 [run:r-1].\nAblation changes accuracy by -73.9% [run:r-2].\n";
+    let (_dir, path) = built_from(draft, &runs);
+    assert_eq!(mismatched(&path), [pair("C2", "-73.9%")]);
+}
+
+#[test]
+fn percent_and_point_figures_match_on_both_scales() {
+    // Metrics on the 0..100 scale, and a percent difference.
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"acc","value":71.3}
+{"kind":"metric","run":"r-2","name":"acc","value":65.2}
+"#
+    );
+    let (_dir, path) = built_from("This is 6.1% above the baseline [exp:E1].\n", &runs);
+    assert!(mismatched(&path).is_empty());
+
+    // Points against a metric on the 0..1 scale.
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"acc","value":0.713}
+"#
+    );
+    let (_dir, path) = built_from("Accuracy reaches 71.3 points [run:r-1].\n", &runs);
+    assert!(mismatched(&path).is_empty());
+}
+
+#[test]
+fn a_plain_number_is_not_matched_to_a_scaled_difference() {
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"tool_calls","value":4.21}
+{"kind":"metric","run":"r-2","name":"tool_calls","value":4.15}
+"#
+    );
+    let (_dir, path) = built_from("Tool calls stay below 6.0 [exp:E1].\n", &runs);
+    assert_eq!(mismatched(&path), [pair("C1", "6.0")]);
+}
+
+#[test]
+fn matching_stays_within_the_written_precision() {
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"error","value":0.0}
+"#
+    );
+    let (_dir, path) = built_from("Error is 0.0000000001 [run:r-1].\n", &runs);
+    assert_eq!(mismatched(&path), [pair("C1", "0.0000000001")]);
+}
+
+#[test]
+fn equal_runs_support_a_zero_difference() {
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"acc","value":0.5}
+{"kind":"metric","run":"r-2","name":"acc","value":0.5}
+"#
+    );
+    let (_dir, path) = built_from("The gap is 0.00 [exp:E1].\n", &runs);
+    assert!(mismatched(&path).is_empty());
+}
+
+#[test]
+fn a_broken_reference_on_a_supported_claim_is_a_finding() {
+    let (_dir, path) = built(&MESSY);
+    let audit = answers::audit(&path).unwrap();
+    assert_eq!(
+        audit.broken,
+        [Link {
+            claim: "C6".into(),
+            kind: "source".into(),
+            target: "ndiaye2022".into(),
+            supports: false,
+            reason: "not listed in References".into(),
+        }]
+    );
+    assert_eq!(audit.findings(), 5);
+
+    let draft = "Our planner reaches 99.9% task success [run:r-004] [@lee2025].\n\n## References\n\n- [@lee2025] Lee. A paper. 2025.\n";
+    let (_dir, path) = built_from(draft, CLEAN.runs);
+    let audit = answers::audit(&path).unwrap();
+    assert!(audit.report.unsupported.is_empty());
+    assert_eq!(audit.broken.len(), 1);
+    assert_eq!(audit.broken[0].reason, "run status is failed");
+}
+
+#[test]
+fn explain_shows_a_mismatched_figure() {
+    let (_dir, path) = built(&MESSY);
+    let c1 = answers::explain(&path, "C1").unwrap();
+    assert_eq!(ids(&c1.mismatches, |m| &m.figure), ["74.2%"]);
+}
+
+#[test]
+fn derivations_carry_their_operands_in_the_dump() {
+    let (_dir, path) = built(&CLEAN);
+    let dump = answers::dump(&path).unwrap();
+    assert!(
+        dump.iter().any(|line| line
+            == "(:Derivation {minuend: 'r-002 success_rate', op: 'difference', subtrahend: 'r-001 success_rate'})"),
+        "{dump:#?}"
+    );
+}
+
+#[test]
+fn replace_leaves_no_temporary_files() {
+    let (dir, path) = built(&CLEAN);
+    ingest(&CLEAN, &path, true).unwrap();
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["claims.rl"]);
 }

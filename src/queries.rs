@@ -76,25 +76,40 @@ pub const WRITES: &[(&str, Option<&str>)] = &[
         Some("figures"),
     ),
     // A measured figure matches a metric when the metric, rounded to the figure's written
-    // precision, gives the figure: 71.3% matches 0.7128 and 0.713, not 0.714.
+    // precision, gives the figure, on the fraction scale or the percent scale: 71.3% matches
+    // 0.7128, 0.713 and 71.3, not 0.714. The allowance on top of the written tolerance only
+    // absorbs floating-point roundoff, so 0.0000000001 does not match 0. Matches are found
+    // across the whole log, so `trace` can also show a run the claim does not cite.
     (
         "MATCH (f:Figure), (m:Metric) \
          WHERE f.measured \
-           AND (abs(m.value - f.value) <= f.tolerance + 1e-9 \
-                OR abs(m.value - f.raw) <= f.raw_tolerance + 1e-9) \
+           AND (abs(m.value - f.value) <= f.tolerance + 1e-12 * (abs(m.value) + abs(f.value)) \
+                OR abs(m.value - f.raw) <= f.raw_tolerance + 1e-12 * (abs(m.value) + abs(f.raw))) \
          CREATE (f)-[:MATCHES]->(m)",
         None,
     ),
-    // A measured figure that matches no metric may be the difference between two runs of
-    // one experiment, as in "6.1 points above the baseline".
+    // A measured figure that no completed run the claim cites produced directly may be the
+    // difference between two completed runs of an experiment the claim rests on, as in
+    // "6.1 points above the baseline". The larger value is the minuend; equal values give
+    // one pair, ordered by run ID. The figure's sign is ignored, as in "-2.0 points".
     (
-        "MATCH (f:Figure) WHERE f.measured AND NOT EXISTS { MATCH (f)-[:MATCHES]->() } \
+        "MATCH (c:Claim)-[:STATES]->(f:Figure) \
+         WHERE f.measured \
+           AND NOT EXISTS { \
+             MATCH (c)-[:SUPPORTED_BY|HAS_RUN*1..2]->(r:Run)-[:PRODUCED]->(:Metric)<-[:MATCHES]-(f) \
+             WHERE r.status = 'completed' } \
          MATCH (e:Experiment)-[:HAS_RUN]->(r1:Run)-[:PRODUCED]->(m1:Metric), \
                (e)-[:HAS_RUN]->(r2:Run)-[:PRODUCED]->(m2:Metric) \
-         WHERE r1 <> r2 AND m1.name = m2.name AND m1.value > m2.value \
-           AND (abs((m1.value - m2.value) - f.value) <= f.tolerance + 1e-9 \
-                OR abs((m1.value - m2.value) * 100 - f.raw) <= f.raw_tolerance + 1e-9) \
-         CREATE (f)-[:DERIVED_AS]->(d:Derivation {op: 'difference'}), \
+         WHERE r1 <> r2 AND m1.name = m2.name \
+           AND r1.status = 'completed' AND r2.status = 'completed' \
+           AND (m1.value > m2.value OR (m1.value = m2.value AND r1.id < r2.id)) \
+           AND EXISTS { MATCH (c)-[:SUPPORTED_BY]->(x) \
+                        WHERE x = e OR EXISTS { MATCH (e)-[:HAS_RUN]->(x) } } \
+         WITH f, r1, r2, m1, m2, m1.value - m2.value AS diff \
+         WHERE abs(diff - abs(f.value)) <= f.tolerance + 1e-12 * (abs(diff) + abs(f.value)) \
+            OR abs(diff - abs(f.raw)) <= f.raw_tolerance + 1e-12 * (abs(diff) + abs(f.raw)) \
+         CREATE (f)-[:DERIVED_AS]->(d:Derivation {op: 'difference', \
+                  minuend: r1.id + ' ' + m1.name, subtrahend: r2.id + ' ' + m2.name}), \
                 (d)-[:MINUEND]->(m1), (d)-[:SUBTRAHEND]->(m2)",
         None,
     ),
@@ -125,7 +140,8 @@ RETURN c.ordinal AS ordinal, c.id AS claim,
        CASE WHEN x:Run THEN 'run:' ELSE 'exp:' END + x.id AS ref";
 
 /// A claim is supported when a path of CITES, SUPPORTED_BY and HAS_RUN leads to a source
-/// the draft lists or to a completed run.
+/// the draft lists or to a completed run. Each unsupported claim comes with the references
+/// in it that point at nothing.
 pub const UNSUPPORTED: &str = "\
 MATCH (c:Claim)
 WHERE NOT EXISTS {
@@ -133,13 +149,22 @@ WHERE NOT EXISTS {
   WHERE (t:Source AND EXISTS { MATCH (:Draft)-[:LISTS]->(t) })
      OR (t:Run AND t.status = 'completed')
 }
-RETURN c.id AS id, c.section AS section, c.text AS text
+RETURN c.id AS id, c.section AS section, c.text AS text,
+       COLLECT {
+         MATCH (c)-[:CITES]->(s:Source)
+         WHERE NOT EXISTS { MATCH (:Draft)-[:LISTS]->(s) }
+         RETURN '@' + s.key AS ref
+         UNION
+         MATCH (c)-[:SUPPORTED_BY]->(x)
+         WHERE x.logged = false
+         RETURN CASE WHEN x:Run THEN 'run:' ELSE 'exp:' END + x.id AS ref
+       } AS unresolved
 ORDER BY c.ordinal";
 
 /// Sentences the claim rule left as prose.
 pub const PROSE: &str = "\
 MATCH (p:Sentence) WHERE NOT p:Claim
-RETURN p.id AS id, p.section AS section, p.text AS text
+RETURN p.id AS id, p.section AS section, p.text AS text, [] AS unresolved
 ORDER BY p.ordinal";
 
 pub const CLAIM_TOTAL: &str = "MATCH (c:Claim) RETURN count(c) AS n";
@@ -150,17 +175,42 @@ MATCH (s:Sentence {id: $id})
 RETURN s.id AS id, s.section AS section, s.text AS text, s.reasons AS reasons,
        COUNT { MATCH (c:Claim) WHERE c = s } AS is_claim";
 
-/// Every reference a claim makes, with the facts that decide whether it supports.
+/// Every reference a claim makes, whether it supports the claim and why. With
+/// `$broken_only`, only references that do not support a claim that is otherwise supported,
+/// which the unsupported-claims check alone would hide.
 pub const LINKS: &str = "\
-MATCH (c:Claim {id: $id})-[l:CITES|SUPPORTED_BY]->(t)
-RETURN CASE WHEN t:Source THEN 'source' WHEN t:Run THEN 'run' ELSE 'experiment' END AS kind,
-       coalesce(t.id, t.key) AS target,
-       COUNT { MATCH (:Draft)-[:LISTS]->(t) } AS listed,
-       coalesce(t.logged, true) AS logged,
-       t.status AS status,
-       COUNT { MATCH (t)-[:HAS_RUN]->(:Run) } AS runs,
-       COUNT { MATCH (t)-[:HAS_RUN]->(r:Run) WHERE r.status = 'completed' } AS completed_runs
-ORDER BY kind, target";
+MATCH (c:Claim)-[:CITES|SUPPORTED_BY]->(t)
+WHERE $id IS NULL OR c.id = $id
+WITH c, t,
+     CASE WHEN t:Source THEN 'source' WHEN t:Run THEN 'run' ELSE 'experiment' END AS kind,
+     COUNT { MATCH (:Draft)-[:LISTS]->(t) } AS listed,
+     COUNT { MATCH (t)-[:HAS_RUN]->(:Run) } AS runs,
+     COUNT { MATCH (t)-[:HAS_RUN]->(r:Run) WHERE r.status = 'completed' } AS completed
+WITH c, t, kind,
+     CASE
+       WHEN kind = 'source' THEN listed > 0
+       WHEN t.logged = false THEN false
+       WHEN kind = 'run' THEN coalesce(t.status = 'completed', false)
+       ELSE completed > 0
+     END AS supports,
+     CASE
+       WHEN kind = 'source' AND listed > 0 THEN 'listed in References'
+       WHEN kind = 'source' THEN 'not listed in References'
+       WHEN t.logged = false THEN 'not in the run log'
+       WHEN kind = 'run' AND t.status = 'completed' THEN 'run completed'
+       WHEN kind = 'run' THEN 'run status is ' + coalesce(t.status, 'missing')
+       WHEN runs = 0 THEN 'experiment has no runs'
+       WHEN completed = 0 THEN 'none of its ' + toString(runs) + ' runs completed'
+       ELSE toString(completed) + ' of its ' + toString(runs) + ' runs completed'
+     END AS reason,
+     EXISTS {
+       MATCH (c)-[:CITES|SUPPORTED_BY|HAS_RUN*1..2]->(s)
+       WHERE (s:Source AND EXISTS { MATCH (:Draft)-[:LISTS]->(s) })
+          OR (s:Run AND s.status = 'completed')
+     } AS claim_supported
+WHERE NOT $broken_only OR (NOT supports AND claim_supported)
+RETURN c.id AS claim, kind, coalesce(t.id, t.key) AS target, supports, reason
+ORDER BY c.ordinal, kind, target";
 
 /// Every supporting path of one claim, as the IDs along it.
 pub const SUPPORT_PATHS: &str = "\
@@ -217,21 +267,28 @@ MATCH (d)-[:MINUEND]->(m1:Metric)<-[:PRODUCED]-(r1:Run)<-[:HAS_RUN]-(e:Experimen
       (d)-[:SUBTRAHEND]->(m2:Metric)<-[:PRODUCED]-(r2:Run)
 RETURN m1.name AS metric, r1.id AS minuend_run, m1.value AS minuend,
        r2.id AS subtrahend_run, m2.value AS subtrahend, e.id AS experiment,
-       COUNT { MATCH (c)-[:SUPPORTED_BY|HAS_RUN*1..2]->(e2) WHERE e2 = e OR e2 = r1 OR e2 = r2 } AS cited
+       COUNT { MATCH (c)-[:SUPPORTED_BY|HAS_RUN*1..2]->(r1) }
+         * COUNT { MATCH (c)-[:SUPPORTED_BY|HAS_RUN*1..2]->(r2) } AS cited
 ORDER BY minuend_run, subtrahend_run";
 
-/// Measured figures in claims that rest on completed runs, where none of those runs
-/// produced the figure, directly or as a difference. Names the runs that did produce it
-/// and the other claims that state those runs' values.
+/// Measured figures in claims that rest on completed runs, where none of the completed
+/// runs the claim cites produced the figure directly, and no difference of two such runs
+/// gives it. Returns what those runs measured and the other claims that state those values.
 pub const MISMATCHES: &str = "\
 MATCH (c:Claim)-[:STATES]->(f:Figure)
-WHERE f.measured
+WHERE ($id IS NULL OR c.id = $id)
+  AND f.measured
   AND EXISTS { MATCH (c)-[:SUPPORTED_BY|HAS_RUN*1..2]->(r:Run) WHERE r.status = 'completed' }
   AND NOT EXISTS {
-    MATCH (c)-[:SUPPORTED_BY|HAS_RUN*1..2]->(r:Run)-[:PRODUCED]->(m:Metric)
+    MATCH (c)-[:SUPPORTED_BY|HAS_RUN*1..2]->(r:Run)-[:PRODUCED]->(:Metric)<-[:MATCHES]-(f)
     WHERE r.status = 'completed'
-      AND (EXISTS { MATCH (f)-[:MATCHES]->(m) }
-           OR EXISTS { MATCH (f)-[:DERIVED_AS]->(:Derivation)-[:MINUEND|SUBTRAHEND]->(m) })
+  }
+  AND NOT EXISTS {
+    MATCH (f)-[:DERIVED_AS]->(d:Derivation)-[:MINUEND]->(:Metric)<-[:PRODUCED]-(r1:Run),
+          (d)-[:SUBTRAHEND]->(:Metric)<-[:PRODUCED]-(r2:Run)
+    WHERE r1.status = 'completed' AND r2.status = 'completed'
+      AND EXISTS { MATCH (c)-[:SUPPORTED_BY|HAS_RUN*1..2]->(r1) }
+      AND EXISTS { MATCH (c)-[:SUPPORTED_BY|HAS_RUN*1..2]->(r2) }
   }
 RETURN c.id AS claim, f.as_written AS figure,
        COLLECT {
