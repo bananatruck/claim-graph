@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn numbers_inside_words_are_ignored() {
-        check("r2 E1 v1.2 GPT4 _12 12_ é2 2é α.12", &[]);
+        check("r2 E1 v1.2 ABC4 _12 12_ é2 2é α.12", &[]);
     }
 
     #[test]
