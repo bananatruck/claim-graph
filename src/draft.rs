@@ -74,9 +74,13 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Words that end with a period without ending a sentence, compared lowercase.
+/// `al.` counts only after `et`, and `No.` only before a number (see `is_abbreviation`).
 const ABBREVIATIONS: &[&str] = &[
     "e.g", "i.e", "al", "fig", "figs", "sec", "eq", "eqs", "tab", "vs", "cf", "approx", "no",
 ];
+
+/// Characters that may close a sentence after its final punctuation: `.)`, `."`.
+const CLOSERS: &[char] = &[')', ']', '"', '\'', '\u{201D}', '\u{2019}'];
 
 /// Parse a draft. Every sentence outside the References section is kept;
 /// `classify` decides which ones are checkable claims.
@@ -84,6 +88,16 @@ pub fn parse_draft(input: &str) -> Result<Draft, ParseError> {
     let mut parser = Parser::default();
     for (index, raw) in input.lines().enumerate() {
         parser.line(index + 1, raw)?;
+    }
+    if let Some(block) = parser.block {
+        let (line, what) = match block {
+            Block::Fence { line, .. } => (line, "code fence"),
+            Block::Math { line } => (line, "`$$` math block"),
+        };
+        return Err(ParseError {
+            line,
+            message: format!("{what} opened here is never closed"),
+        });
     }
     parser.flush()?;
     Ok(Draft {
@@ -93,13 +107,21 @@ pub fn parse_draft(input: &str) -> Result<Draft, ParseError> {
     })
 }
 
+#[derive(Clone, Copy)]
+enum Block {
+    /// A code fence of `len` backticks, opened on `line`.
+    Fence { len: usize, line: usize },
+    /// A `$$` display-math block opened on `line`.
+    Math { line: usize },
+}
+
 #[derive(Default)]
 struct Parser {
     title: Option<String>,
     section: String,
     in_references: bool,
-    /// Inside a ``` fence or a `$$` display-math block.
-    in_block: Option<&'static str>,
+    /// Inside a code fence or a `$$` display-math block.
+    block: Option<Block>,
     paragraph: Paragraph,
     sentences: Vec<Sentence>,
     sources: Vec<Source>,
@@ -135,25 +157,51 @@ impl Paragraph {
 
 impl Parser {
     fn line(&mut self, line: usize, raw: &str) -> Result<(), ParseError> {
-        let trimmed = raw.trim();
-        if let Some(fence) = self.in_block {
-            if trimmed.starts_with(fence) {
-                self.in_block = None;
+        let mut trimmed = raw.trim();
+        let ticks = trimmed.chars().take_while(|c| *c == '`').count();
+        match self.block {
+            // A fence closes on a line of at least as many backticks and nothing else.
+            Some(Block::Fence { len, .. }) => {
+                if ticks >= len && trimmed[ticks..].trim().is_empty() {
+                    self.block = None;
+                }
+                return Ok(());
             }
+            Some(Block::Math { .. }) => {
+                if trimmed.starts_with("$$") || trimmed.ends_with("$$") {
+                    self.block = None;
+                }
+                return Ok(());
+            }
+            None => {}
+        }
+        // Three or more backticks open a fence, unless the line closes them again,
+        // which makes it inline code.
+        if ticks >= 3 && !trimmed[ticks..].contains('`') {
+            self.flush()?;
+            self.block = Some(Block::Fence { len: ticks, line });
             return Ok(());
         }
-        if let Some(fence) = ["```", "$$"].into_iter().find(|f| trimmed.starts_with(f)) {
+        if let Some(rest) = trimmed.strip_prefix("$$") {
             self.flush()?;
-            // A one-line `$$ ... $$` block opens and closes on the same line.
-            let one_line = fence == "$$" && trimmed.len() > 2 && trimmed.ends_with("$$");
-            if !one_line {
-                self.in_block = Some(fence);
+            match rest.find("$$") {
+                // `$$ ... $$` on one line: drop the math, keep any text after it.
+                Some(close) => trimmed = rest[close + 2..].trim(),
+                None => {
+                    self.block = Some(Block::Math { line });
+                    return Ok(());
+                }
             }
-        } else if let Some(heading) = trimmed.strip_prefix("# ") {
+        }
+        if let Some(heading) = trimmed.strip_prefix("# ") {
+            // A top-level heading also ends the References section.
             self.flush()?;
+            let heading = heading.trim().to_string();
             if self.title.is_none() {
-                self.title = Some(heading.trim().to_string());
+                self.title = Some(heading.clone());
             }
+            self.section = heading;
+            self.in_references = false;
         } else if let Some(heading) = trimmed.strip_prefix("## ") {
             self.flush()?;
             self.section = heading.trim().to_string();
@@ -260,18 +308,28 @@ fn list_item(trimmed: &str) -> Option<&str> {
 /// A sentence ends at `.`, `!` or `?` followed by whitespace or the end of the text,
 /// except after one of the `ABBREVIATIONS`.
 fn split_sentences(text: &str) -> Vec<(usize, &str)> {
+    let markers = marker_spans(text);
+    let inside_marker = |index: usize| markers.iter().any(|&(a, b)| a < index && index < b);
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut sentences = Vec::new();
     let mut start = 0;
-    let mut chars = text.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
-        let at_boundary = chars.peek().is_none_or(|(_, next)| next.is_whitespace());
-        if !matches!(ch, '.' | '!' | '?') || !at_boundary {
+    for (position, &(index, ch)) in chars.iter().enumerate() {
+        if index < start || !matches!(ch, '.' | '!' | '?') || inside_marker(index) {
             continue;
         }
-        if ch == '.' && chars.peek().is_some() && ends_with_abbreviation(&text[start..index]) {
+        // Closing brackets and quotes after the punctuation belong to the sentence.
+        let mut next = position + 1;
+        while chars.get(next).is_some_and(|&(_, c)| CLOSERS.contains(&c)) {
+            next += 1;
+        }
+        let end = chars.get(next).map_or(text.len(), |&(b, _)| b);
+        let at_boundary = chars.get(next).is_none_or(|&(_, c)| c.is_whitespace());
+        if !at_boundary {
             continue;
         }
-        let end = index + ch.len_utf8();
+        if ch == '.' && next < chars.len() && is_abbreviation(&text[start..index], &text[end..]) {
+            continue;
+        }
         push_trimmed(&mut sentences, text, start, end);
         start = end;
     }
@@ -279,8 +337,31 @@ fn split_sentences(text: &str) -> Vec<(usize, &str)> {
     sentences
 }
 
-/// Whether the word just before a period is a known abbreviation.
-fn ends_with_abbreviation(before_period: &str) -> bool {
+/// Byte ranges of `[@...]`, `[run:...]` and `[exp:...]` markers, to the closing `]` or the
+/// end of the text.
+fn marker_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(found) = text[from..].find('[') {
+        let open = from + found;
+        let after = &text[open + 1..];
+        if after.starts_with('@') || after.starts_with("run:") || after.starts_with("exp:") {
+            let close = after.find(']').map_or(text.len(), |c| open + 1 + c);
+            spans.push((open, close));
+            from = close.min(text.len());
+        } else {
+            from = open + 1;
+        }
+        if from >= text.len() {
+            break;
+        }
+    }
+    spans
+}
+
+/// Whether the word just before a period is a known abbreviation, given the text before
+/// the period and the text after it.
+fn is_abbreviation(before_period: &str, after_period: &str) -> bool {
     let word: String = before_period
         .chars()
         .rev()
@@ -290,7 +371,19 @@ fn ends_with_abbreviation(before_period: &str) -> bool {
         .rev()
         .collect();
     let word = word.to_lowercase();
-    ABBREVIATIONS.contains(&word.as_str())
+    if !ABBREVIATIONS.contains(&word.as_str()) {
+        return false;
+    }
+    match word.as_str() {
+        "al" => before_period[..before_period.len() - word.len()]
+            .split_whitespace()
+            .next_back()
+            .is_some_and(|previous| previous.eq_ignore_ascii_case("et")),
+        "no" => after_period
+            .trim_start()
+            .starts_with(|c: char| c.is_ascii_digit()),
+        _ => true,
+    }
 }
 
 fn push_trimmed<'a>(out: &mut Vec<(usize, &'a str)>, text: &'a str, start: usize, end: usize) {
@@ -471,6 +564,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(texts(&draft), ["A claim with 4 parts."]);
+    }
+
+    #[test]
+    fn a_one_line_code_span_at_line_start_is_not_a_fence() {
+        let draft =
+            parse_draft("```x = 1``` sets the seed to 3.\n\nNext claim has 2 parts.\n").unwrap();
+        assert_eq!(
+            texts(&draft),
+            ["```x = 1``` sets the seed to 3.", "Next claim has 2 parts."]
+        );
+    }
+
+    #[test]
+    fn inline_display_math_is_removed_and_the_rest_of_the_line_kept() {
+        let draft = parse_draft("$$x = 1$$ where x is seed 7.\n").unwrap();
+        assert_eq!(texts(&draft), ["where x is seed 7."]);
+    }
+
+    #[test]
+    fn a_math_block_closes_at_a_line_ending_in_dollars() {
+        let draft = parse_draft("$$\nx = y + z $$\nAfter the math there are 2 claims.\n").unwrap();
+        assert_eq!(texts(&draft), ["After the math there are 2 claims."]);
+    }
+
+    #[test]
+    fn a_fence_closes_only_with_a_bare_run_at_least_as_long() {
+        let draft =
+            parse_draft("````\n```\ncode 1.\n```\n````\nReal text has 2 claims.\n").unwrap();
+        assert_eq!(texts(&draft), ["Real text has 2 claims."]);
+        let draft = parse_draft("```\ncode\n``` not a close\n```\nText has 3 parts.\n").unwrap();
+        assert_eq!(texts(&draft), ["Text has 3 parts."]);
+    }
+
+    #[test]
+    fn an_unclosed_block_is_an_error_naming_its_opening_line() {
+        assert_eq!(
+            parse_draft("Intro has 1.\n\n```\ncode\n").unwrap_err().line,
+            3
+        );
+        assert_eq!(
+            parse_draft("Intro has 1.\n$$\nx = 1\n").unwrap_err().line,
+            2
+        );
+    }
+
+    #[test]
+    fn a_sentence_ends_after_closing_brackets_and_quotes() {
+        let draft =
+            parse_draft("(Prior work reaches 60% [@lee2025].) Ours reaches 99.9%.\n").unwrap();
+        assert_eq!(
+            texts(&draft),
+            [
+                "(Prior work reaches 60% [@lee2025].)",
+                "Ours reaches 99.9%."
+            ]
+        );
+        assert!(draft.sentences[1].citations.is_empty());
+        let draft = parse_draft("\"Prior work reaches 60%.\" Ours reaches 99.9%.\n").unwrap();
+        assert_eq!(draft.sentences.len(), 2);
+    }
+
+    #[test]
+    fn punctuation_inside_a_reference_marker_does_not_split() {
+        let draft = parse_draft("See [@lab. ; @lee] for 2 results.\n").unwrap();
+        assert_eq!(texts(&draft), ["See [@lab. ; @lee] for 2 results."]);
+        assert_eq!(draft.sentences[0].citations, ["lab.", "lee"]);
+    }
+
+    #[test]
+    fn no_is_an_abbreviation_only_before_a_number() {
+        let draft = parse_draft("Does it need shaping? No. It reaches 99.9%.\n").unwrap();
+        assert_eq!(
+            texts(&draft),
+            ["Does it need shaping?", "No.", "It reaches 99.9%."]
+        );
+        let draft = parse_draft("See No. 3 in the list.\n").unwrap();
+        assert_eq!(draft.sentences.len(), 1);
+    }
+
+    #[test]
+    fn al_is_an_abbreviation_only_after_et() {
+        let draft = parse_draft("The team named it al. Then 2 runs failed.\n").unwrap();
+        assert_eq!(draft.sentences.len(), 2);
+    }
+
+    #[test]
+    fn a_title_heading_after_references_ends_the_references() {
+        let draft =
+            parse_draft("## References\n- [@a] One.\n# Appendix\nWe add 1 note.\n").unwrap();
+        assert_eq!(texts(&draft), ["We add 1 note."]);
+        assert_eq!(draft.sentences[0].section, "Appendix");
+        assert_eq!(draft.sources.len(), 1);
     }
 
     #[test]
