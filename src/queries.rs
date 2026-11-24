@@ -31,6 +31,9 @@ pub const WRITES: &[(&str, Option<&str>)] = &[
          CREATE (e)-[:HAS_RUN]->(:Run {id: r.id, seed: r.seed, status: r.status, logged: true})",
         Some("runs"),
     ),
+    // `run` on a Metric, like `claim` and `index` on a Figure, repeats what the relationship
+    // says on purpose: it keeps each node identifiable in the canonical dump, which compares
+    // stores by content and has no stable internal IDs to rely on.
     (
         "UNWIND $metrics AS m MATCH (r:Run {id: m.run}) \
          CREATE (r)-[:PRODUCED]->(:Metric {run: m.run, name: m.name, value: m.value})",
