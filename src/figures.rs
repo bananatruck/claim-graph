@@ -76,6 +76,8 @@ pub fn extract_figures(text: &str) -> Vec<Figure> {
                 // A digit before the hyphen is a range ("10-20") unless that digit belongs
                 // to an identifier ("x86-64").
                 Some(c) if c.is_ascii_digit() => run_follows_letter(&chars, start - 2),
+                // After a percent sign or a multiplier the hyphen joins a range ("71.3%-73.9%").
+                Some('%' | '\u{00D7}') => false,
                 Some(c) => {
                     negative = !c.is_alphanumeric();
                     false
@@ -300,6 +302,17 @@ mod tests {
             &[
                 ("10", 10.0, 0.5, 10.0, 0.5, false),
                 ("20", 20.0, 0.5, 20.0, 0.5, false),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_hyphen_after_a_percentage_is_a_range() {
+        check(
+            "71.3%-73.9%",
+            &[
+                ("71.3%", 0.713, 0.0005, 71.3, 0.05, true),
+                ("73.9%", 0.739, 0.0005, 73.9, 0.05, true),
             ],
         );
     }
