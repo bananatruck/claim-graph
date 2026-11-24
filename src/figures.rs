@@ -1,82 +1,168 @@
+//! Numbers stated in a sentence, with the precision they were written with.
+
 /// A numeric token with its written precision and optional percent scaling.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Figure {
+    /// The token as written, sign and unit suffix included: "71.3%", "-0.25", "12.5ms".
     pub as_written: String,
+    /// On the fraction scale when `percent` is set ("71.3%" and "6.1 points" give 0.713 and
+    /// 0.061), otherwise the number itself.
     pub value: f64,
+    /// Half a unit in the last written digit, on the scale of `value`.
     pub tolerance: f64,
+    /// The number as written, without percent scaling.
     pub raw: f64,
+    /// Half a unit in the last written digit, on the scale of `raw`.
     pub raw_tolerance: f64,
+    /// Written with `%`, or followed by the word "points", "point" or "pp".
     pub percent: bool,
 }
 
-/// Extract numeric tokens in order, excluding numbers embedded in words.
+/// Extract numeric tokens in order, excluding numbers that are part of identifiers
+/// (`r2`, `v1.2.3`, `gpt-3.5-turbo`, `UTF-8`), ordinals (`3rd`) and long glued suffixes.
+/// A short unit suffix of up to three ASCII letters (`12.5ms`, `10k`, `3x`) is kept in
+/// `as_written` and does not change the value.
 pub fn extract_figures(text: &str) -> Vec<Figure> {
-    let bytes = text.as_bytes();
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let at = |i: usize| chars.get(i).map(|&(_, c)| c);
+    let byte = |i: usize| chars.get(i).map_or(text.len(), |&(b, _)| b);
+    let digits_from = |mut i: usize| {
+        let begin = i;
+        while at(i).is_some_and(|c| c.is_ascii_digit()) {
+            i += 1;
+        }
+        i - begin
+    };
+
     let mut figures = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        let ch = text[index..].chars().next().expect("index is in the text");
-        if !ch.is_ascii_digit() {
-            index += ch.len_utf8();
+    let mut i = 0;
+    while i < chars.len() {
+        if !at(i).is_some_and(|c| c.is_ascii_digit()) {
+            i += 1;
             continue;
         }
-
-        let start = index;
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            index += 1;
+        let start = i;
+        i += digits_from(i);
+        while at(i) == Some(',') && digits_from(i + 1) == 3 {
+            i += 4;
         }
-        while bytes.get(index) == Some(&b',') {
-            let group_start = index + 1;
-            let mut group_end = group_start;
-            while bytes.get(group_end).is_some_and(u8::is_ascii_digit) {
-                group_end += 1;
-            }
-            if group_end - group_start != 3 {
-                break;
-            }
-            index = group_end;
-        }
-
         let mut decimal_places = 0;
-        if bytes.get(index) == Some(&b'.') && bytes.get(index + 1).is_some_and(u8::is_ascii_digit) {
-            index += 1;
-            let decimal_start = index;
-            while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-                index += 1;
-            }
-            decimal_places = index - decimal_start;
+        if at(i) == Some('.') && at(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+            decimal_places = digits_from(i + 1);
+            i += 1 + decimal_places;
         }
-        let number_end = index;
-        let percent = bytes.get(index) == Some(&b'%');
-        if let Some(suffix @ ('%' | 'x' | '×')) = text[index..].chars().next() {
-            index += suffix.len_utf8();
-        }
+        let number_end = i;
 
-        let mut before = text[..start].chars().rev();
-        let previous = before.next();
-        let blocked_before = previous.is_some_and(is_word_character)
-            || (previous == Some('.') && before.next().is_some_and(char::is_alphabetic));
-        let blocked_after = text[index..].chars().next().is_some_and(is_word_character);
-        if blocked_before || blocked_after {
+        // A further `.digit` makes this a dotted identifier such as 1.2.3: skip all of it.
+        if at(i) == Some('.') && at(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+            while at(i).is_some_and(|c| c.is_ascii_digit() || c == '.') {
+                i += 1;
+            }
             continue;
         }
 
-        let digits = text[start..number_end].replace(',', "");
-        let raw = digits
+        let previous = start.checked_sub(1).and_then(at);
+        let before_previous = start.checked_sub(2).and_then(at);
+        let mut negative = false;
+        let blocked_before = match previous {
+            Some(c) if is_word_character(c) => true,
+            Some('.') => before_previous.is_some_and(char::is_alphanumeric),
+            Some('-' | '\u{2212}') => match before_previous {
+                None => {
+                    negative = true;
+                    false
+                }
+                Some(c) if c.is_alphabetic() || c == '_' => true,
+                // A digit before the hyphen is a range ("10-20") unless that digit belongs
+                // to an identifier ("x86-64").
+                Some(c) if c.is_ascii_digit() => run_follows_letter(&chars, start - 2),
+                Some(c) => {
+                    negative = !c.is_alphanumeric();
+                    false
+                }
+            },
+            _ => false,
+        };
+
+        let mut end = i;
+        let mut percent = false;
+        let mut blocked_after = false;
+        match at(end) {
+            Some('%') => {
+                percent = true;
+                end += 1;
+                blocked_after = at(end).is_some_and(is_word_character);
+            }
+            Some('\u{00D7}') => {
+                end += 1;
+                blocked_after = at(end).is_some_and(is_word_character);
+            }
+            Some(c) if c.is_ascii_alphabetic() => {
+                let mut k = end;
+                while at(k).is_some_and(|c| c.is_ascii_alphabetic()) {
+                    k += 1;
+                }
+                let suffix = text[byte(end)..byte(k)].to_ascii_lowercase();
+                blocked_after = k - end > 3
+                    || at(k).is_some_and(|c| is_word_character(c) || c == '-')
+                    || matches!(suffix.as_str(), "st" | "nd" | "rd" | "th");
+                end = k;
+            }
+            Some('-') => blocked_after = at(end + 1).is_some_and(char::is_alphabetic),
+            Some(c) => blocked_after = is_word_character(c),
+            None => {}
+        }
+        if blocked_before || blocked_after {
+            i = end.max(i);
+            continue;
+        }
+        if end == number_end && !percent {
+            percent = followed_by_points(&text[byte(end)..]);
+        }
+
+        let digits = text[byte(start)..byte(number_end)].replace(',', "");
+        let magnitude = digits
             .parse::<f64>()
             .expect("numeric token has valid digits");
+        let raw = if negative { -magnitude } else { magnitude };
         let raw_tolerance = 0.5 * 10.0_f64.powf(-(decimal_places as f64));
         let scale = if percent { 100.0 } else { 1.0 };
+        let written_start = if negative { start - 1 } else { start };
         figures.push(Figure {
-            as_written: text[start..index].to_string(),
+            as_written: text[byte(written_start)..byte(end)].to_string(),
             value: raw / scale,
             tolerance: raw_tolerance / scale,
             raw,
             raw_tolerance,
             percent,
         });
+        i = end;
     }
     figures
+}
+
+/// Whether the run of digits and dots ending at `index` starts right after a letter.
+fn run_follows_letter(chars: &[(usize, char)], index: usize) -> bool {
+    let mut k = index;
+    while k > 0 && (chars[k - 1].1.is_ascii_digit() || chars[k - 1].1 == '.') {
+        k -= 1;
+    }
+    k > 0 && (chars[k - 1].1.is_alphabetic() || chars[k - 1].1 == '_')
+}
+
+/// Whether the text after a number starts with whitespace and the word "points", "point"
+/// or "pp".
+fn followed_by_points(rest: &str) -> bool {
+    let trimmed = rest.trim_start();
+    if trimmed.len() == rest.len() {
+        return false;
+    }
+    let word: String = trimmed
+        .chars()
+        .take_while(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    matches!(word.as_str(), "points" | "point" | "pp")
 }
 
 fn is_word_character(ch: char) -> bool {
@@ -182,8 +268,60 @@ mod tests {
     }
 
     #[test]
-    fn ordinal_and_unit_suffixes_are_ignored() {
-        check("3rd 2b 10k 12.5kg 3xfaster 3×faster 65%of 2x_ 2×٣", &[]);
+    fn ordinals_and_long_or_glued_suffixes_are_ignored() {
+        check("3rd 1st 22nd 4th 3xfaster 3×faster 65%of 2x_ 2×٣ 2é", &[]);
+    }
+
+    #[test]
+    fn short_unit_suffixes_keep_the_figure() {
+        check(
+            "12.5ms and 4.2GB and 10k",
+            &[
+                ("12.5ms", 12.5, 0.05, 12.5, 0.05, false),
+                ("4.2GB", 4.2, 0.05, 4.2, 0.05, false),
+                ("10k", 10.0, 0.5, 10.0, 0.5, false),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_leading_minus_belongs_to_a_standalone_number() {
+        check(
+            "Loss was -0.25 and accuracy changed by \u{2212}3.1% (-2).",
+            &[
+                ("-0.25", -0.25, 0.005, -0.25, 0.005, false),
+                ("\u{2212}3.1%", -0.031, 0.0005, -3.1, 0.05, true),
+                ("-2", -2.0, 0.5, -2.0, 0.5, false),
+            ],
+        );
+        // A hyphen after a number is a range, not a sign.
+        check(
+            "10-20",
+            &[
+                ("10", 10.0, 0.5, 10.0, 0.5, false),
+                ("20", 20.0, 0.5, 20.0, 0.5, false),
+            ],
+        );
+    }
+
+    #[test]
+    fn dotted_and_hyphenated_identifiers_are_not_figures() {
+        check(
+            "release v1.2.3.4 with gpt-3.5-turbo in section 1.2.3, UTF-8 and x86-64",
+            &[],
+        );
+        check("We describe v1.2.3.", &[]);
+    }
+
+    #[test]
+    fn points_are_on_the_percent_scale() {
+        check(
+            "It is 6.1 points above and 2 pp below.",
+            &[
+                ("6.1", 0.061, 0.0005, 6.1, 0.05, true),
+                ("2", 0.02, 0.005, 2.0, 0.5, true),
+            ],
+        );
     }
 
     #[test]
