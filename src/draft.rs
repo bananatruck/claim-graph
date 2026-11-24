@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn prose_and_claims_are_numbered_separately() {
         let draft =
-            parse_draft("We study planners. We reach 71.3% success. The setup follows.\n").unwrap();
+            parse_draft("We study planners. Accuracy is 71.3% here. The setup follows.\n").unwrap();
         assert_eq!(ids(&draft), ["P1", "C1", "P2"]);
         assert_eq!(draft.sentences[1].reasons, [Reason::Number]);
         assert!(draft.sentences[0].reasons.is_empty());
