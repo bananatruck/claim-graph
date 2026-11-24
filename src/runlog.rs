@@ -286,7 +286,16 @@ mod tests {
     fn the_synthetic_run_log_parses() {
         let log = parse_run_log(include_str!("../data/synthetic/runs.jsonl")).unwrap();
         assert_eq!(log.experiments.len(), 3);
-        assert_eq!(log.runs.len(), 3);
-        assert_eq!(log.metrics.len(), 2);
+        assert_eq!(log.runs.len(), 4);
+        assert_eq!(log.metrics.len(), 3);
+    }
+
+    #[test]
+    fn the_messy_synthetic_run_log_parses() {
+        let log = parse_run_log(include_str!("../data/synthetic/messy/runs.jsonl")).unwrap();
+        assert_eq!(log.experiments.len(), 3);
+        assert_eq!(log.runs.len(), 5);
+        assert_eq!(log.metrics.len(), 6);
+        assert_eq!(log.experiments[0].supersedes.as_deref(), Some("E11"));
     }
 }

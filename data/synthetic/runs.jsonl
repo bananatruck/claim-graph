@@ -6,4 +6,6 @@
 {"kind":"metric","run":"r-001","name":"success_rate","value":0.652}
 {"kind":"run","id":"r-002","experiment":"E1","seed":1,"status":"completed"}
 {"kind":"metric","run":"r-002","name":"success_rate","value":0.713}
+{"kind":"run","id":"r-003","experiment":"E1","seed":2,"status":"completed"}
+{"kind":"metric","run":"r-003","name":"success_rate","value":0.689}
 {"kind":"run","id":"r-004","experiment":"E3","seed":1,"status":"failed"}
