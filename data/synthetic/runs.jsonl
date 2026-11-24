@@ -1,0 +1,9 @@
+{"kind":"note","text":"SYNTHETIC TEST DATA written by hand for Claim Graph. No run listed here happened."}
+{"kind":"experiment","id":"E1","name":"planner vs baseline"}
+{"kind":"experiment","id":"E2","name":"long-task study"}
+{"kind":"experiment","id":"E3","name":"critic ablation"}
+{"kind":"run","id":"r-001","experiment":"E1","seed":1,"status":"completed"}
+{"kind":"metric","run":"r-001","name":"success_rate","value":0.652}
+{"kind":"run","id":"r-002","experiment":"E1","seed":1,"status":"completed"}
+{"kind":"metric","run":"r-002","name":"success_rate","value":0.713}
+{"kind":"run","id":"r-004","experiment":"E3","seed":1,"status":"failed"}
