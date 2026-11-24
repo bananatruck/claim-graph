@@ -83,6 +83,9 @@ impl From<std::io::Error> for StoreError {
 }
 
 /// Build the graph in a new store at `path`, in one transaction, then checkpoint and close it.
+///
+/// The store is built in a temporary file beside `path` and moved into place only when it
+/// is complete, so a failed ingest with `replace` leaves the previous store untouched.
 pub fn ingest(
     path: &Path,
     draft_path: &str,
@@ -90,7 +93,7 @@ pub fn ingest(
     log: &RunLog,
     replace: bool,
 ) -> Result<IngestSummary, StoreError> {
-    let uri = store_uri(path)?;
+    store_uri(path)?;
     if path.exists() {
         if !replace {
             return Err(StoreError::Exists(path.to_path_buf()));
@@ -101,9 +104,40 @@ pub fn ingest(
                 path.display()
             )));
         }
-        std::fs::remove_file(path)?;
     }
+    let temporary = temporary_path(path);
+    let built = build(&temporary, draft_path, draft, log);
+    let result = built.and_then(|summary| {
+        std::fs::rename(&temporary, path)?;
+        Ok(summary)
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
 
+/// A path in the same directory as `path`, ending in `.rl`, that no other ingest uses.
+fn temporary_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map_or_else(|| "store".into(), |s| s.to_string_lossy().into_owned());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    path.with_file_name(format!(".{stem}.ingest-{}-{nanos}.rl", std::process::id()))
+}
+
+fn build(
+    path: &Path,
+    draft_path: &str,
+    draft: &Draft,
+    log: &RunLog,
+) -> Result<IngestSummary, StoreError> {
+    let uri = store_uri(path)?;
+    if path.exists() {
+        return Err(StoreError::Exists(path.to_path_buf()));
+    }
     let rows = rows(draft_path, draft, log);
     let db = relate::Database::open(uri)?;
     let mut conn = db.connect()?;
