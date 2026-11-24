@@ -191,7 +191,8 @@ mod tests {
 
     #[test]
     fn a_run_naming_an_unknown_experiment_is_an_error() {
-        let input = "{\"kind\":\"run\",\"id\":\"r\",\"experiment\":\"E9\",\"status\":\"completed\"}\n";
+        let input =
+            "{\"kind\":\"run\",\"id\":\"r\",\"experiment\":\"E9\",\"status\":\"completed\"}\n";
         assert_eq!(error_line(input), 1);
     }
 

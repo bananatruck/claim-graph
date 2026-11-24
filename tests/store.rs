@@ -66,7 +66,10 @@ fn the_reopened_store_holds_the_whole_graph() {
         ("PRODUCED", 2),
     ];
     for (rel_type, expected) in rels {
-        let n = count(&path, &format!("MATCH ()-[r:{rel_type}]->() RETURN count(r)"));
+        let n = count(
+            &path,
+            &format!("MATCH ()-[r:{rel_type}]->() RETURN count(r)"),
+        );
         assert_eq!(n, expected, "relationships of type {rel_type}");
     }
 }

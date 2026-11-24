@@ -244,7 +244,10 @@ fn extract_references(sentence: &str) -> Result<References, (usize, String)> {
         match kind {
             Kind::Citation => {
                 for part in body.split(';') {
-                    let key = part.trim().strip_prefix('@').ok_or_else(|| bad("citation"))?;
+                    let key = part
+                        .trim()
+                        .strip_prefix('@')
+                        .ok_or_else(|| bad("citation"))?;
                     if !is_identifier(key) {
                         return Err(bad("citation"));
                     }

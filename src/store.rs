@@ -22,7 +22,7 @@ pub struct IngestSummary {
 }
 
 /// A claim with no path to a completed run or a listed source.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct UnsupportedClaim {
     pub id: String,
     pub section: String,
@@ -31,7 +31,7 @@ pub struct UnsupportedClaim {
 }
 
 /// The answer to "which claims are unsupported", read from the store.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Report {
     pub total_claims: usize,
     pub unsupported: Vec<UnsupportedClaim>,
@@ -96,7 +96,10 @@ ORDER BY c.ordinal";
 
 /// Each write statement and the parameter it reads its rows from.
 const WRITES: &[(&str, &str)] = &[
-    ("draft", "CREATE (:Draft {path: $draft.path, title: $draft.title})"),
+    (
+        "draft",
+        "CREATE (:Draft {path: $draft.path, title: $draft.title})",
+    ),
     (
         "sources",
         "MATCH (d:Draft) UNWIND $sources AS s \
@@ -271,8 +274,7 @@ impl Rows {
 
         let source_keys: HashSet<&str> = draft.sources.iter().map(|s| s.key.as_str()).collect();
         let run_ids: HashSet<&str> = log.runs.iter().map(|r| r.id.as_str()).collect();
-        let experiment_ids: HashSet<&str> =
-            log.experiments.iter().map(|e| e.id.as_str()).collect();
+        let experiment_ids: HashSet<&str> = log.experiments.iter().map(|e| e.id.as_str()).collect();
 
         let mut unresolved = Vec::new();
         let mut claims = Vec::new();
