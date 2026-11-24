@@ -240,6 +240,12 @@ pub fn trace(
 ) -> Result<Vec<FigureTrace>, StoreError> {
     let db = open_read_only(path)?;
     let mut conn = db.connect()?;
+    if let Some(id) = claim {
+        let found = conn.query_with_params(queries::SENTENCE, params(&json!({"id": id}))?)?;
+        if found.rows.is_empty() {
+            return Err(StoreError::UnknownSentence(id.to_string()));
+        }
+    }
     traces(&mut conn, figure, claim)
 }
 
