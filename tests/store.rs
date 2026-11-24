@@ -628,3 +628,25 @@ fn replace_leaves_no_temporary_files() {
         .collect();
     assert_eq!(names, ["claims.rl"]);
 }
+
+#[test]
+fn the_roundoff_allowance_stays_below_the_written_precision() {
+    // Direct match: 1000000000000.0 is written to 0.05, so 1000000000001.0 must not match.
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"count","value":1000000000001.0}
+"#
+    );
+    let (_dir, path) = built_from("We reached 1000000000000.0 steps [run:r-1].\n", &runs);
+    assert_eq!(mismatched(&path), [pair("C1", "1000000000000.0")]);
+
+    // Difference: 3000000000001.0 - 2000000000000.0 is 1000000000001.0, not the figure.
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"count","value":3000000000001.0}
+{"kind":"metric","run":"r-2","name":"count","value":2000000000000.0}
+"#
+    );
+    let (_dir, path) = built_from("The gap is 1000000000000.0 steps [exp:E1].\n", &runs);
+    assert_eq!(mismatched(&path), [pair("C1", "1000000000000.0")]);
+}

@@ -81,13 +81,15 @@ pub const WRITES: &[(&str, Option<&str>)] = &[
     // A measured figure matches a metric when the metric, rounded to the figure's written
     // precision, gives the figure, on the fraction scale or the percent scale: 71.3% matches
     // 0.7128, 0.713 and 71.3, not 0.714. The allowance on top of the written tolerance only
-    // absorbs floating-point roundoff, so 0.0000000001 does not match 0. Matches are found
+    // absorbs floating-point roundoff: a few units in the last place of the operands
+    // (1e-15 relative), so 0.0000000001 does not match 0 and 1000000000000.0 does not
+    // match 1000000000001.0. Matches are found
     // across the whole log, so `trace` can also show a run the claim does not cite.
     (
         "MATCH (f:Figure), (m:Metric) \
          WHERE f.measured \
-           AND (abs(m.value - f.value) <= f.tolerance + 1e-12 * (abs(m.value) + abs(f.value)) \
-                OR abs(m.value - f.raw) <= f.raw_tolerance + 1e-12 * (abs(m.value) + abs(f.raw))) \
+           AND (abs(m.value - f.value) <= f.tolerance + 1e-15 * (abs(m.value) + abs(f.value)) \
+                OR abs(m.value - f.raw) <= f.raw_tolerance + 1e-15 * (abs(m.value) + abs(f.raw))) \
          CREATE (f)-[:MATCHES]->(m)",
         None,
     ),
@@ -109,8 +111,8 @@ pub const WRITES: &[(&str, Option<&str>)] = &[
            AND EXISTS { MATCH (c)-[:SUPPORTED_BY]->(x) \
                         WHERE x = e OR EXISTS { MATCH (e)-[:HAS_RUN]->(x) } } \
          WITH f, r1, r2, m1, m2, m1.value - m2.value AS diff \
-         WHERE abs(diff - abs(f.value)) <= f.tolerance + 1e-12 * (abs(diff) + abs(f.value)) \
-            OR abs(diff - abs(f.raw)) <= f.raw_tolerance + 1e-12 * (abs(diff) + abs(f.raw)) \
+         WHERE abs(diff - abs(f.value)) <= f.tolerance + 1e-15 * (abs(m1.value) + abs(m2.value) + abs(f.value)) \
+            OR abs(diff - abs(f.raw)) <= f.raw_tolerance + 1e-15 * (abs(m1.value) + abs(m2.value) + abs(f.raw)) \
          CREATE (f)-[:DERIVED_AS]->(d:Derivation {op: 'difference', \
                   minuend: r1.id + ' ' + m1.name, subtrahend: r2.id + ' ' + m2.name}), \
                 (d)-[:MINUEND]->(m1), (d)-[:SUBTRAHEND]->(m2)",
