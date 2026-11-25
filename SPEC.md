@@ -197,6 +197,7 @@ When none is, it reports what those runs measured and which other claims state t
 ## Command-line surface
 
 - `claim-graph ingest --draft FILE --runs FILE --store FILE.rl [--replace]`
+  The store is built in a temporary file beside `FILE.rl` and published only when complete. Without `--replace`, publication fails if `FILE.rl` exists by then, even when another ingest created it meanwhile; with `--replace`, the new store replaces the old one in one rename.
 - `claim-graph unsupported --store FILE.rl [--prose] [--fail] [--format text|json]`
 - `claim-graph explain --store FILE.rl --claim C4 [--format text|json]`
 - `claim-graph trace --store FILE.rl (--figure "71.3%" | --claim C1) [--format text|json]`, with exactly one of the two selectors.
