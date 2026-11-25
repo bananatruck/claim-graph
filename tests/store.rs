@@ -511,7 +511,13 @@ fn a_difference_needs_both_runs_cited() {
     let (_dir, path) = built_from(&draft, MESSY.runs);
     assert!(mismatched(&path).contains(&pair("C2", "4.4")));
     let traces = answers::trace(&path, Some("4.4"), None).unwrap();
-    assert!(traces[0].differences.iter().all(|d| !d.cited));
+    // trace still shows the comparison, marked as not cited.
+    let pairs: Vec<(&str, &str, bool)> = traces[0]
+        .differences
+        .iter()
+        .map(|d| (d.minuend_run.as_str(), d.subtrahend_run.as_str(), d.cited))
+        .collect();
+    assert_eq!(pairs, [("m-07", "m-06", false)]);
 }
 
 #[test]
