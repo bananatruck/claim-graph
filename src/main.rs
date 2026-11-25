@@ -78,8 +78,10 @@ enum Command {
     Trace {
         #[command(flatten)]
         common: Common,
-        /// The number exactly as written in the draft, such as "71.3%" or "6.1".
-        #[arg(long)]
+        /// The number exactly as written in the draft, such as "71.3%", "6.1" or "-0.5%".
+        // Any value may start with a hyphen: figures can be negative and carry a suffix, which
+        // clap's negative-number setting would not accept ("-0.5%").
+        #[arg(long, allow_hyphen_values = true)]
         figure: Option<String>,
         /// Trace every number in one claim instead.
         #[arg(long)]

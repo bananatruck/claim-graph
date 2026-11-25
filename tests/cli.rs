@@ -461,3 +461,23 @@ fn the_snapshot_codec_does_not_follow_the_environment() {
         other => panic!("expected a JSON snapshot, found {other:?}"),
     }
 }
+
+/// A figure value that starts with a hyphen reaches the trace in both argument forms.
+#[test]
+fn trace_accepts_a_negative_figure_as_a_separate_value() {
+    let (_dir, store) = clean_store();
+    let store = store.to_str().unwrap();
+    for figure in ["-0.5", "-0.5%"] {
+        let joined = format!("--figure={figure}");
+        let separate = run(&["trace", "--store", store, "--figure", figure]);
+        let together = run(&["trace", "--store", store, &joined]);
+        assert_eq!(
+            separate.status.code(),
+            Some(1),
+            "{}",
+            text(&separate.stderr)
+        );
+        assert_eq!(text(&separate.stderr), text(&together.stderr));
+        assert!(text(&separate.stderr).contains(&format!("states \"{figure}\"")));
+    }
+}
