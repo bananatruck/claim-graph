@@ -481,11 +481,12 @@ pub(crate) fn is_identifier(text: &str) -> bool {
             .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
 }
 
-/// A Markdown ATX heading: one to six `#` followed by a space, a tab or the end of the
-/// line. Other text that starts with `#` ("#1 reached 74.2%") is ordinary text.
+/// A heading: one to six `#` followed by a space or the end of the line, as SPEC.md
+/// defines headings. Other text that starts with `#` ("#1 reached 74.2%", "##\tResults")
+/// is ordinary text, so it is checked rather than dropped.
 fn is_atx_heading(line: &str) -> bool {
     let level = line.bytes().take_while(|&b| b == b'#').count();
-    (1..=6).contains(&level) && matches!(line.as_bytes().get(level), None | Some(b' ' | b'\t'))
+    (1..=6).contains(&level) && matches!(line.as_bytes().get(level), None | Some(b' '))
 }
 
 #[cfg(test)]
@@ -587,6 +588,21 @@ mod tests {
                 "Last claim has 2 parts."
             ]
         );
+    }
+
+    #[test]
+    fn a_tab_after_hashes_is_not_a_heading() {
+        // SPEC: a heading's `#` run is followed by a space or the end of the line, so a
+        // tab-separated line is a sentence, kept and checked rather than dropped.
+        let draft = parse_draft("## Results\n\n##\tTuned run reached 74.2% [run:r].\n").unwrap();
+        assert_eq!(texts(&draft), ["##\tTuned run reached 74.2% [run:r]."]);
+        assert_eq!(draft.sentences[0].section, "Results");
+        assert!(draft.sentences[0].is_claim());
+
+        // Inside References it is not a heading either, so it is reported at its own line.
+        let error =
+            parse_draft("## References\n- [@a] One.\n##\tAppendix\nWe add 1 note.\n").unwrap_err();
+        assert_eq!(error.line, 3, "{error}");
     }
 
     #[test]
