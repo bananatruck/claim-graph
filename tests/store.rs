@@ -383,8 +383,17 @@ fn ingest_refuses_an_existing_store_unless_replace_is_given() {
     let (_dir, path) = built(&CLEAN);
     let err = ingest(&CLEAN, &path, false).unwrap_err();
     assert!(matches!(err, StoreError::Exists(_)), "got {err}");
-    ingest(&CLEAN, &path, true).unwrap();
-    assert_eq!(count(&path, "MATCH (c:Claim) RETURN count(c)"), 7);
+    // Replace with a different graph, so a replacement that kept the old store would fail.
+    ingest(&MESSY, &path, true).unwrap();
+    let (_messy_dir, messy) = built(&MESSY);
+    assert_eq!(
+        answers::dump(&path).unwrap(),
+        answers::dump(&messy).unwrap()
+    );
+    assert_ne!(
+        answers::dump(&path).unwrap(),
+        answers::dump(&built(&CLEAN).1).unwrap()
+    );
 }
 
 #[test]
@@ -621,7 +630,7 @@ fn derivations_carry_their_operands_in_the_dump() {
 #[test]
 fn replace_leaves_no_temporary_files() {
     let (dir, path) = built(&CLEAN);
-    ingest(&CLEAN, &path, true).unwrap();
+    ingest(&MESSY, &path, true).unwrap();
     let names: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
