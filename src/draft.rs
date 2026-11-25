@@ -207,7 +207,7 @@ impl Parser {
             self.section = heading.trim().to_string();
             self.in_references = self.section.eq_ignore_ascii_case("references");
         } else if trimmed.is_empty()
-            || trimmed.starts_with('#')
+            || is_atx_heading(trimmed)
             || trimmed.starts_with('>')
             || trimmed.starts_with('|')
             || trimmed.starts_with("![")
@@ -481,6 +481,13 @@ pub(crate) fn is_identifier(text: &str) -> bool {
             .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
 }
 
+/// A Markdown ATX heading: one to six `#` followed by a space, a tab or the end of the
+/// line. Other text that starts with `#` ("#1 reached 74.2%") is ordinary text.
+fn is_atx_heading(line: &str) -> bool {
+    let level = line.bytes().take_while(|&b| b == b'#').count();
+    (1..=6).contains(&level) && matches!(line.as_bytes().get(level), None | Some(b' ' | b'\t'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +571,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(texts(&draft), ["A claim with 4 parts."]);
+    }
+
+    #[test]
+    fn only_atx_headings_are_skipped_and_hash_text_is_a_sentence() {
+        let draft = parse_draft(
+            "# Title\n\n### Results\n\n#### Detail\n\n#1 reached 74.2% [run:r].\n\n#hashtag runs gave 3 wins.\n\n###\n\nLast claim has 2 parts.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            texts(&draft),
+            [
+                "#1 reached 74.2% [run:r].",
+                "#hashtag runs gave 3 wins.",
+                "Last claim has 2 parts."
+            ]
+        );
     }
 
     #[test]

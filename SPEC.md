@@ -36,7 +36,7 @@ There are two datasets: `data/synthetic/` (small and tidy) and `data/synthetic/m
 
 - The first `# ` heading is the draft title.
 - A `## ` heading starts a section; the section name is stored on each sentence.
-- Lines starting with `>` (notes), `|` (table rows) and `![` (images), and deeper headings are skipped.
+- Lines starting with `>` (notes), `|` (table rows) and `![` (images), and deeper headings (three to six `#` followed by a space or the end of the line) are skipped; other text that starts with `#`, such as `#1 reached 74.2%`, is read as a sentence.
 - A line of three or more backticks opens a code fence, closed by a line of at least as many backticks and nothing else; a line that also closes its backticks is inline code, not a fence.
 - A line starting with `$$` opens a math block, closed by a line that starts or ends with `$$`; `$$ ... $$` on one line is removed and the rest of the line kept.
 - A fence or math block still open at the end of the draft is a parse error naming the line that opened it.
