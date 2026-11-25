@@ -430,3 +430,34 @@ fn replace_refuses_a_store_path_that_names_an_input() {
         .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
 }
+
+/// The store's snapshot codec is JSON whatever Relate's environment says.
+#[test]
+fn the_snapshot_codec_does_not_follow_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("claims.rl");
+    let (draft, runs) = (
+        input("data/synthetic/draft.md"),
+        input("data/synthetic/runs.jsonl"),
+    );
+    let out = Command::new(BIN)
+        .env("RELATE_SNAPSHOT_FORMAT", "markdown")
+        .args([
+            "ingest",
+            "--draft",
+            &draft,
+            "--runs",
+            &runs,
+            "--store",
+            store.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    match relate_storage::store_info(&store).unwrap().snapshot {
+        relate_storage::StoreSnapshot::Envelope { codec, .. } => {
+            assert_eq!(codec, relate::SnapshotCodecKind::Json)
+        }
+        other => panic!("expected a JSON snapshot, found {other:?}"),
+    }
+}

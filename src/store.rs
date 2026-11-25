@@ -203,7 +203,15 @@ fn build(
         return Err(StoreError::Exists(path.to_path_buf()));
     }
     let rows = rows(draft_path, draft, log);
-    let db = relate::Database::open(uri)?;
+    // The codec is pinned: otherwise RELATE_SNAPSHOT_FORMAT in the environment chooses it
+    // for a new store (relate 1.2.0, open_config.rs resolve_snapshot_codec).
+    let db = relate::Database::open_with(
+        uri,
+        relate::OpenOptions {
+            snapshot_codec: Some(relate::SnapshotCodecKind::Json),
+            ..Default::default()
+        },
+    )?;
     let mut conn = db.connect()?;
     conn.begin()?;
     for (statement, param) in queries::WRITES {
