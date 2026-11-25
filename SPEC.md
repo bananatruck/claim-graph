@@ -63,6 +63,7 @@ It errs towards checking: a sentence such as "Fig. 3 shows the error rate" count
 A figure is a number in a claim, outside reference markers.
 The text is read as whole words, and the grammar in `src/figures.rs` decides whether a word is a figure, a range of two figures, a comma list written without spaces, or an identifier holding none.
 So `r2`, `v1.2.3`, `1.2.3`, `gpt-3.5-turbo`, `UTF-8`, `x86-64`, `Llama-3.1-8B` and `3rd` are not figures.
+In a list written without spaces, a comma that the number rule reads as a thousands separator stays in its number, so `1,024.5,2.5` is 1,024.5 and 2.5, while `1,23` is 1 and 23.
 A leading minus sign (`-0.25`, `−3.1%`) belongs to the figure; a dash between two figures (`10-20`, `71.3%-73.9%`) is a range.
 A leading dot (`.713`) and an exponent (`1.0e-3`) are part of the number; the exponent scales both the value and the written precision.
 A unit suffix of up to three letters (`12.5ms`, `10k`, `3x`) is kept as written but does not rescale the number.

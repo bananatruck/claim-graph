@@ -9,7 +9,10 @@
 //! ```text
 //! word     = figure                 one figure
 //!          | figure dash figure     a range: two figures ("10-20", "71.3%-73.9%")
-//!          | piece ("," piece)+     a list written without spaces: each piece read again
+//!          | piece ("," piece)+     a list written without spaces: each piece read again;
+//!                                   a comma the number rule reads as a thousands
+//!                                   separator stays inside its piece ("1,024.5,2.5" is
+//!                                   1,024.5 and 2.5)
 //!          | anything else          no figure: an identifier such as v1.2.3, UTF-8,
 //!                                   gpt-3.5-turbo, x86-64 or Llama-3.1-8B
 //! figure   = sign? number exponent? suffix?
@@ -92,13 +95,33 @@ fn read_word(text: &str, offset: usize, word: &str, figures: &mut Vec<Figure>) {
             return;
         }
     }
-    if word.contains(',') {
-        let mut at = 0;
-        for piece in word.split(',') {
-            read_word(text, offset + at, piece, figures);
-            at += piece.len() + 1;
+    let splits = list_commas(word);
+    if !splits.is_empty() {
+        let mut start = 0;
+        for end in splits.into_iter().chain([word.len()]) {
+            read_word(text, offset + start, &word[start..end], figures);
+            start = end + 1;
         }
     }
+}
+
+/// The byte positions of the commas that separate a list written without spaces: every
+/// comma except one the number rule reads as a thousands separator, which follows the
+/// integer digits of its piece and precedes exactly three digits ("1,024.5,2.5" splits
+/// only before "2.5").
+fn list_commas(word: &str) -> Vec<usize> {
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let mut splits = Vec::new();
+    let mut start = 0;
+    for (at, _) in word.match_indices(',') {
+        let piece = word[start..at].trim_start_matches(['-', '\u{2212}']);
+        let integer = !piece.is_empty() && piece.bytes().all(|b| b.is_ascii_digit() || b == b',');
+        if !(integer && digits(&word[at + 1..]) == 3) {
+            splits.push(at);
+            start = at + 1;
+        }
+    }
+    splits
 }
 
 /// Read `word`, found at byte `offset` of `text`, as one figure.
@@ -279,6 +302,18 @@ mod tests {
     }
 
     #[test]
+    fn a_list_split_keeps_thousands_groups_whole() {
+        // A comma the number rule reads as a thousands separator is not a list comma.
+        check(
+            "1,024.5,2.5",
+            &[
+                ("1,024.5", 1024.5, 0.05, 1024.5, 0.05, false),
+                ("2.5", 2.5, 0.05, 2.5, 0.05, false),
+            ],
+        );
+    }
+
+    #[test]
     fn multiplier_suffix() {
         check(
             "3x faster, 2.50× speed.",
@@ -390,6 +425,9 @@ mod tests {
             ("1e1234", &[]),
             ("10-20 1.0e-3-2e-3", &["10", "20", "1.0e-3", "2e-3"]),
             ("1,23", &["1", "23"]),
+            ("1,024.5,2.5 1,234,5", &["1,024.5", "2.5", "1,234", "5"]),
+            ("1.5,250,3 -1,000,2%", &["1.5", "250", "3", "-1,000", "2%"]),
+            ("1,000abcd,5", &["5"]),
             (
                 "12.5ms 4.2GB 3x 2.50\u{00D7}",
                 &["12.5ms", "4.2GB", "3x", "2.50\u{00D7}"],
