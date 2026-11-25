@@ -130,6 +130,9 @@ The gap is a fact in the graph, so the same queries find it.
 
 Matching runs as two Cypher statements at the end of ingest, inside the same transaction.
 A measured figure `MATCHES` a metric when the metric is within the figure's written tolerance of either the scaled value or the written number, so `71.3%` matches 0.7128, 0.713 and 71.3 but not 0.714, and a plain 6.0 matches only 6.0 within 0.05.
+The comparison runs in 64-bit floats, so it allows for their roundoff and nothing more.
+A stored value is off from its decimal by at most u times its magnitude (u = 2^-53, about 1.1e-16), and the subtraction adds at most as much again, so a computed difference is within about 2.2e-16 times the sum of the operands' magnitudes of the exact one.
+The allowance is 1e-15 times each operand's magnitude, summed term by term so it cannot overflow near the largest float, and capped at a millionth of the written tolerance, so `0.30` matches 0.305 but not 0.3050001 and `9e307` matches 9.5e307 but not 9.5000001e307; a difference of two metrics uses the same rule over its three operands.
 `MATCHES` is computed across the whole log, so `trace` can show a run the claim does not cite; only matches with completed runs the claim cites count as support.
 A measured figure that no completed run the claim cites produced directly gets a `Derivation` when it equals, by the same rule, the difference between the same metric in two completed runs of an experiment the claim rests on, so "6.1 points" matches 0.713 minus 0.652.
 A difference supports the claim only when the claim reaches both runs.

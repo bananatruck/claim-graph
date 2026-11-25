@@ -685,6 +685,54 @@ fn the_roundoff_allowance_stays_below_the_written_precision() {
     }
 }
 
+/// The matching rule at its edges: the roundoff allowance is 1e-15 of each operand's
+/// magnitude, summed term by term so that it cannot overflow, and capped at a millionth of the
+/// written tolerance.
+#[test]
+fn the_roundoff_allowance_holds_at_its_edges() {
+    for (figure, metric, matches) in [
+        // Exactly half a unit away matches; any visible distance beyond does not.
+        ("0.30", "0.305", true),
+        ("0.30", "0.3050001", false),
+        // Near the largest float: the operand sum must not overflow into accepting anything.
+        ("9e307", "9.5e307", true),
+        ("9e307", "9.5000001e307", false),
+        ("-9e307", "-9.5000001e307", false),
+        // Tiny magnitudes: no absolute allowance, so a tiny tolerance stays tiny.
+        ("1.0e-300", "1.04e-300", true),
+        ("1.0e-300", "1.06e-300", false),
+    ] {
+        let runs = format!(
+            "{E1_RUNS}{{\"kind\":\"metric\",\"run\":\"r-1\",\"name\":\"x\",\"value\":{metric}}}\n"
+        );
+        let (_dir, path) = built_from(&format!("We reached {figure} loss [run:r-1].\n"), &runs);
+        let expected: &[(String, String)] = if matches {
+            &[]
+        } else {
+            &[pair("C1", figure)][..]
+        };
+        assert_eq!(mismatched(&path), expected, "{figure} vs {metric}");
+    }
+
+    // A difference with a zero baseline near the largest float.
+    for (minuend, figure, derived) in [
+        ("9.5e307", "9e307", true),
+        ("9.5000001e307", "9e307", false),
+    ] {
+        let runs = format!(
+            "{E1_RUNS}{{\"kind\":\"metric\",\"run\":\"r-1\",\"name\":\"x\",\"value\":{minuend}}}\n\
+             {{\"kind\":\"metric\",\"run\":\"r-2\",\"name\":\"x\",\"value\":0.0}}\n"
+        );
+        let (_dir, path) = built_from(&format!("The gap is {figure} [exp:E1].\n"), &runs);
+        let expected: &[(String, String)] = if derived {
+            &[]
+        } else {
+            &[pair("C1", figure)][..]
+        };
+        assert_eq!(mismatched(&path), expected, "{minuend} - 0 vs {figure}");
+    }
+}
+
 /// `audit` reads every finding through one opened store. That is safe only if an opened
 /// store keeps reading one version of the graph while a replacement is published by
 /// rename, and a second open would see the new version; this pins both.
