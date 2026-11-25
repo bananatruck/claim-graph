@@ -184,22 +184,40 @@ fn check_id(id: &str, line: usize) -> Result<(), ParseError> {
 
 /// The line of an experiment on a `supersedes` cycle, if there is one.
 /// Each experiment supersedes at most one other, so following the links from any start
-/// either ends or comes back to an experiment already seen on that walk.
+/// either ends or comes back to an experiment already seen on that walk. Starts are tried
+/// in file order, and the line reported is that of the first experiment a walk meets
+/// twice. A walk that ended without a cycle marks its experiments done, and a later walk
+/// stops at them, so each experiment is visited once and the check is linear.
 fn supersedes_cycle(experiments: &[Experiment], lines: &[usize]) -> Option<usize> {
-    let index_of = |id: &str| experiments.iter().position(|e| e.id == id);
+    #[derive(Clone, Copy, PartialEq)]
+    enum Visit {
+        New,
+        OnWalk,
+        Done,
+    }
+    let mut index = std::collections::HashMap::new();
+    for (i, experiment) in experiments.iter().enumerate() {
+        index.entry(experiment.id.as_str()).or_insert(i);
+    }
+    let mut visit = vec![Visit::New; experiments.len()];
     for start in 0..experiments.len() {
-        let mut seen = vec![start];
-        let mut current = start;
-        while let Some(next) = experiments[current]
-            .supersedes
-            .as_deref()
-            .and_then(index_of)
-        {
-            if seen.contains(&next) {
-                return Some(lines[next]);
+        let mut walk = Vec::new();
+        let mut current = Some(start);
+        while let Some(i) = current {
+            match visit[i] {
+                Visit::Done => break,
+                Visit::OnWalk => return Some(lines[i]),
+                Visit::New => {}
             }
-            seen.push(next);
-            current = next;
+            visit[i] = Visit::OnWalk;
+            walk.push(i);
+            current = experiments[i]
+                .supersedes
+                .as_deref()
+                .and_then(|id| index.get(id).copied());
+        }
+        for i in walk {
+            visit[i] = Visit::Done;
         }
     }
     None
@@ -300,6 +318,72 @@ mod tests {
         let err = parse_run_log(input).unwrap_err();
         assert!(err.message.contains("cycle"), "{}", err.message);
         assert!((1..=3).contains(&err.line));
+    }
+
+    /// The line reported for each shape of `supersedes` links: the first experiment found
+    /// twice on a walk, trying starts in file order.
+    #[test]
+    fn a_supersedes_cycle_reports_where_the_first_walk_meets_itself() {
+        let experiment = |id: &str, supersedes: Option<&str>| match supersedes {
+            Some(s) => format!(
+                "{{\"kind\":\"experiment\",\"id\":\"{id}\",\"name\":\"x\",\"supersedes\":\"{s}\"}}\n"
+            ),
+            None => format!("{{\"kind\":\"experiment\",\"id\":\"{id}\",\"name\":\"x\"}}\n"),
+        };
+        for (links, expected) in [
+            (
+                &[("A", Some("B")), ("B", Some("C")), ("C", Some("A"))][..],
+                Some(1),
+            ),
+            (
+                &[("A", Some("B")), ("B", Some("C")), ("C", Some("B"))],
+                Some(2),
+            ),
+            (&[("A", None), ("B", Some("B"))], Some(2)),
+            (
+                &[
+                    ("A", Some("B")),
+                    ("B", Some("A")),
+                    ("C", Some("D")),
+                    ("D", Some("C")),
+                ],
+                Some(1),
+            ),
+            (
+                &[
+                    ("A", Some("B")),
+                    ("B", None),
+                    ("C", Some("D")),
+                    ("D", Some("C")),
+                ],
+                Some(3),
+            ),
+            (&[("A", Some("B")), ("B", Some("C")), ("C", None)], None),
+        ] {
+            let input: String = links.iter().map(|&(id, s)| experiment(id, s)).collect();
+            let line = parse_run_log(&input).err().map(|e| e.line);
+            assert_eq!(line, expected, "{links:?}");
+        }
+    }
+
+    /// A long chain is checked in time linear in its length.
+    #[test]
+    fn a_long_supersedes_chain_is_checked_quickly() {
+        let n = 20_000;
+        let mut input = String::from("{\"kind\":\"experiment\",\"id\":\"E0\",\"name\":\"x\"}\n");
+        for i in 1..n {
+            input.push_str(&format!(
+                "{{\"kind\":\"experiment\",\"id\":\"E{i}\",\"name\":\"x\",\"supersedes\":\"E{}\"}}\n",
+                i - 1
+            ));
+        }
+        assert_eq!(parse_run_log(&input).unwrap().experiments.len(), n);
+        input = input.replacen(
+            "\"id\":\"E0\",\"name\":\"x\"",
+            &format!("\"id\":\"E0\",\"name\":\"x\",\"supersedes\":\"E{}\"", n - 1),
+            1,
+        );
+        assert!(parse_run_log(&input).is_err());
     }
 
     #[test]
