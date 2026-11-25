@@ -180,28 +180,30 @@ enum Lists {
 fn list_commas(text: &str, offset: usize, word: &str) -> Option<Lists> {
     let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
     let commas: Vec<usize> = word.match_indices(',').map(|(at, _)| at).collect();
-    let forced: Vec<usize> = commas
-        .iter()
-        .copied()
-        .filter(|&at| digits(&word[at + 1..]) != 3)
-        .collect();
-    let bounds: Vec<(usize, usize)> = std::iter::once(0)
-        .chain(forced.iter().map(|&at| at + 1))
-        .zip(forced.iter().copied().chain([word.len()]))
-        .collect();
-    let mut chosen = forced.clone();
+    let whole_excluded = commas.iter().all(|&at| digits(&word[at + 1..]) == 3);
+    // One pass: possible thousands separators gather into the current stretch, and each
+    // forced list comma, or the end of the word, closes it.
+    let mut chosen = Vec::new();
     let mut ambiguous = false;
-    for (low, high) in bounds {
-        let inside: Vec<usize> = commas
-            .iter()
-            .copied()
-            .filter(|&at| low < at && at < high)
-            .collect();
-        match stretch_commas(text, offset, word, low, high, &inside, forced.is_empty()) {
+    let mut inside = Vec::new();
+    let mut low = 0;
+    for at in commas.into_iter().map(Some).chain([None]) {
+        let high = match at {
+            Some(at) if digits(&word[at + 1..]) == 3 => {
+                inside.push(at);
+                continue;
+            }
+            Some(at) => at,
+            None => word.len(),
+        };
+        match stretch_commas(text, offset, word, low, high, &inside, whole_excluded) {
             Some(Lists::None) => return Some(Lists::None),
             Some(Lists::One(found)) => chosen.extend(found),
             None => ambiguous = true,
         }
+        chosen.extend(at);
+        inside.clear();
+        low = high + 1;
     }
     if ambiguous {
         return None;
@@ -766,6 +768,19 @@ mod tests {
         // The refused word is reported where it stands.
         let error = extract_figures("seeds 2 and 1,234,5 runs").unwrap_err();
         assert_eq!((error.offset, error.as_written.as_str()), (12, "1,234,5"));
+    }
+
+    /// Reading a list is linear in its commas outside runs of possible thousands
+    /// separators: 100,000 items took about 90 s when each stretch scanned every comma.
+    /// Within a stretch at most `MAX_LIST_COMMAS` candidates are weighed, so the work there
+    /// is bounded by a constant times the stretch length.
+    #[test]
+    fn a_long_list_without_spaces_reads_in_linear_time() {
+        let word = vec!["1"; 100_000].join(",");
+        let started = std::time::Instant::now();
+        assert_eq!(extract_figures(&word).unwrap().len(), 100_000);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
     }
 
     #[test]
