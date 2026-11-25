@@ -306,9 +306,8 @@ fn rows(draft_path: &str, draft: &Draft, log: &RunLog) -> Json {
             experiment_links.push(json!({"claim": sentence.id, "id": id}));
         }
         for (index, figure) in sentence.figures.iter().enumerate() {
-            // Only percentages and numbers written with decimals are treated as
+            // Percentages and numbers written with a decimal point or an exponent are
             // measurements; bare integers are usually counts ("3 seeds", "2024").
-            let measured = figure.percent || figure.as_written.contains('.');
             figures.push(json!({
                 "claim": sentence.id,
                 "index": index,
@@ -318,7 +317,7 @@ fn rows(draft_path: &str, draft: &Draft, log: &RunLog) -> Json {
                 "raw": figure.raw,
                 "raw_tolerance": figure.raw_tolerance,
                 "percent": figure.percent,
-                "measured": measured,
+                "measured": figure.measured,
             }));
         }
     }

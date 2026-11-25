@@ -2,7 +2,7 @@
 
 ## The idea in one sentence
 
-Claim Graph reads a research agent's paper draft and its run log into a single-file Relate graph and reports every checkable claim that has no path to a completed run or a listed source, every reference that fails on an otherwise supported claim, every claim that rests on a superseded experiment, and every measured figure (a percentage or a decimal) in a claim resting on completed runs that those runs did not produce.
+Claim Graph reads a research agent's paper draft and its run log into a single-file Relate graph and reports every checkable claim that has no path to a completed run or a listed source, every reference that fails on an otherwise supported claim, every claim that rests on a superseded experiment, and every measured figure (a percentage, a decimal or a number with an exponent) in a claim resting on completed runs that those runs did not produce.
 Bare integers, numbers in claims supported only by citations, and sentences the claim rule leaves as prose are not checked against metrics.
 
 ## User and problem
@@ -60,12 +60,15 @@ It errs towards checking: a sentence such as "Fig. 3 shows the error rate" count
 
 ### Figures
 
-A figure is a number in a claim, outside reference markers, and not part of an identifier: `r2`, `v1.2.3`, `1.2.3`, `gpt-3.5-turbo`, `UTF-8` and `3rd` are not figures.
-A leading minus sign (`-0.25`, `−3.1%`) belongs to the figure; a hyphen between two numbers (`10-20`) is a range.
+A figure is a number in a claim, outside reference markers.
+The text is read as whole words, and the grammar in `src/figures.rs` decides whether a word is a figure, a range of two figures, a comma list written without spaces, or an identifier holding none.
+So `r2`, `v1.2.3`, `1.2.3`, `gpt-3.5-turbo`, `UTF-8`, `x86-64`, `Llama-3.1-8B` and `3rd` are not figures.
+A leading minus sign (`-0.25`, `−3.1%`) belongs to the figure; a dash between two figures (`10-20`, `71.3%-73.9%`) is a range.
+A leading dot (`.713`) and an exponent (`1.0e-3`) are part of the number; the exponent scales both the value and the written precision.
 A unit suffix of up to three letters (`12.5ms`, `10k`, `3x`) is kept as written but does not rescale the number.
 `71.3%` and "71.3 points" (or `pp`) are on the percent scale: stored as 0.713, and as written, 71.3.
 Each figure carries the precision it was written with: half a unit in its last digit.
-Only percentages and numbers written with decimals count as measurements; bare integers are treated as counts ("3 seeds", "2024") and never matched to metrics.
+Only percentages and numbers written with a decimal point or an exponent count as measurements; bare integers are treated as counts ("3 seeds", "2024") and never matched to metrics.
 
 ### Run log (JSON Lines)
 
@@ -228,7 +231,7 @@ The committed stores are therefore checked by content: `cargo test` rebuilds bot
 
 - Draft parser: title, sections, sentence splitting around decimals and abbreviations, notes, tables, images, code and math skipped, all list styles, all reference forms, figures outside markers only, malformed references with their line numbers.
 - Claim rule: each reason on its own, plain prose, whole-word matching, numbers inside identifiers.
-- Figures: percentages, points, decimals, integers, signs, ranges, thousands separators, multipliers, unit suffixes, ordinals, dotted and hyphenated identifiers.
+- Figures: one table row per grammar rule, plus percentages, points, decimals with and without a leading digit, exponents, integers, signs, ranges, thousands separators, multipliers, unit suffixes, ordinals, dotted and hyphenated identifiers.
 - Run log: each kind, any order, extra fields, `supersedes`, cycles, IDs a draft cannot reference, duplicates, dangling references, invalid JSON.
 - Store, on real `.rl` files reopened read-only: node and relationship counts, unsupported claims and prose, a report that changes when the graph is edited directly, `explain` reasons and paths, `trace` matches, differences and the no-source case, stale chains, mismatches, broken references on supported claims, each trigger input from the first review round, read-only `query`, refusal to overwrite, replacement without leftovers, the path rule, and a missing store.
 - The committed stores match a rebuild by content, and are single-file bundles with the JSON codec.

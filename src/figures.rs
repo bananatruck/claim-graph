@@ -1,4 +1,26 @@
 //! Numbers stated in a sentence, with the precision they were written with.
+//!
+//! The text is read as words, and each whole word either is a figure or holds none.
+//! A word is a maximal run of letters, digits, `_`, `.`, `,`, `+`, `%`, `×` and the
+//! dashes `-`, `−` (minus sign) and `–` (en dash); any other character separates words.
+//! Trailing `.` and `,` and leading `,` and `+` are punctuation, not part of the word.
+//! A word is then read by this grammar, first rule that fits:
+//!
+//! ```text
+//! word     = figure                 one figure
+//!          | figure dash figure     a range: two figures ("10-20", "71.3%-73.9%")
+//!          | piece ("," piece)+     a list written without spaces: each piece read again
+//!          | anything else          no figure: an identifier such as v1.2.3, UTF-8,
+//!                                   gpt-3.5-turbo, x86-64 or Llama-3.1-8B
+//! figure   = sign? number exponent? suffix?
+//! sign     = "-" | "−"
+//! number   = digits ("," 3 digits)* ("." digits)? | "." digits
+//! exponent = ("e" | "E") ("-" | "+" | "−")? 1 to 3 digits
+//! suffix   = "%" | "×" | 1 to 3 ASCII letters other than st, nd, rd, th
+//! ```
+//!
+//! A figure is a measurement when it is a percentage or has a decimal point or an
+//! exponent; a bare integer is usually a count ("3 seeds", "2024").
 
 /// A numeric token with its written precision and optional percent scaling.
 #[derive(Debug, Clone, PartialEq)]
@@ -16,140 +38,144 @@ pub struct Figure {
     pub raw_tolerance: f64,
     /// Written with `%`, or followed by the word "points", "point" or "pp".
     pub percent: bool,
+    /// A percentage, or written with a decimal point or an exponent.
+    pub measured: bool,
 }
 
-/// Extract numeric tokens in order, excluding numbers that are part of identifiers
-/// (`r2`, `v1.2.3`, `gpt-3.5-turbo`, `UTF-8`), ordinals (`3rd`) and long glued suffixes.
-/// A short unit suffix of up to three ASCII letters (`12.5ms`, `10k`, `3x`) is kept in
-/// `as_written` and does not change the value.
+const DASHES: [char; 3] = ['-', '\u{2212}', '\u{2013}'];
+
+fn is_word_part(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(c, '_' | '.' | ',' | '+' | '%' | '\u{00D7}')
+        || DASHES.contains(&c)
+}
+
+/// Extract the figures of `text` in order, by the grammar in the module documentation.
 pub fn extract_figures(text: &str) -> Vec<Figure> {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let at = |i: usize| chars.get(i).map(|&(_, c)| c);
-    let byte = |i: usize| chars.get(i).map_or(text.len(), |&(b, _)| b);
-    let digits_from = |mut i: usize| {
-        let begin = i;
-        while at(i).is_some_and(|c| c.is_ascii_digit()) {
-            i += 1;
-        }
-        i - begin
-    };
-
     let mut figures = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if !at(i).is_some_and(|c| c.is_ascii_digit()) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        i += digits_from(i);
-        while at(i) == Some(',') && digits_from(i + 1) == 3 {
-            i += 4;
-        }
-        let mut decimal_places = 0;
-        if at(i) == Some('.') && at(i + 1).is_some_and(|c| c.is_ascii_digit()) {
-            decimal_places = digits_from(i + 1);
-            i += 1 + decimal_places;
-        }
-        let number_end = i;
-
-        // A further `.digit` makes this a dotted identifier such as 1.2.3: skip all of it.
-        if at(i) == Some('.') && at(i + 1).is_some_and(|c| c.is_ascii_digit()) {
-            while at(i).is_some_and(|c| c.is_ascii_digit() || c == '.') {
-                i += 1;
-            }
-            continue;
-        }
-
-        let previous = start.checked_sub(1).and_then(at);
-        let before_previous = start.checked_sub(2).and_then(at);
-        let mut negative = false;
-        let blocked_before = match previous {
-            Some(c) if is_word_character(c) => true,
-            Some('.') => before_previous.is_some_and(char::is_alphanumeric),
-            Some('-' | '\u{2212}') => match before_previous {
-                None => {
-                    negative = true;
-                    false
-                }
-                Some(c) if c.is_alphabetic() || c == '_' => true,
-                // A digit before the hyphen is a range ("10-20") unless that digit belongs
-                // to an identifier ("x86-64").
-                Some(c) if c.is_ascii_digit() => run_follows_letter(&chars, start - 2),
-                // After a percent sign or a multiplier the hyphen joins a range ("71.3%-73.9%").
-                Some('%' | '\u{00D7}') => false,
-                Some(c) => {
-                    negative = !c.is_alphanumeric();
-                    false
-                }
-            },
-            _ => false,
-        };
-
-        let mut end = i;
-        let mut percent = false;
-        let mut blocked_after = false;
-        match at(end) {
-            Some('%') => {
-                percent = true;
-                end += 1;
-                blocked_after = at(end).is_some_and(is_word_character);
-            }
-            Some('\u{00D7}') => {
-                end += 1;
-                blocked_after = at(end).is_some_and(is_word_character);
-            }
-            Some(c) if c.is_ascii_alphabetic() => {
-                let mut k = end;
-                while at(k).is_some_and(|c| c.is_ascii_alphabetic()) {
-                    k += 1;
-                }
-                let suffix = text[byte(end)..byte(k)].to_ascii_lowercase();
-                blocked_after = k - end > 3
-                    || at(k).is_some_and(|c| is_word_character(c) || c == '-')
-                    || matches!(suffix.as_str(), "st" | "nd" | "rd" | "th");
-                end = k;
-            }
-            Some('-') => blocked_after = at(end + 1).is_some_and(char::is_alphabetic),
-            Some(c) => blocked_after = is_word_character(c),
-            None => {}
-        }
-        if blocked_before || blocked_after {
-            i = end.max(i);
-            continue;
-        }
-        if end == number_end && !percent {
-            percent = followed_by_points(&text[byte(end)..]);
-        }
-
-        let digits = text[byte(start)..byte(number_end)].replace(',', "");
-        let magnitude = digits
-            .parse::<f64>()
-            .expect("numeric token has valid digits");
-        let raw = if negative { -magnitude } else { magnitude };
-        let raw_tolerance = 0.5 * 10.0_f64.powf(-(decimal_places as f64));
-        let scale = if percent { 100.0 } else { 1.0 };
-        let written_start = if negative { start - 1 } else { start };
-        figures.push(Figure {
-            as_written: text[byte(written_start)..byte(end)].to_string(),
-            value: raw / scale,
-            tolerance: raw_tolerance / scale,
-            raw,
-            raw_tolerance,
-            percent,
-        });
-        i = end;
+    let mut rest = text;
+    while let Some(begin) = rest.find(is_word_part) {
+        let tail = &rest[begin..];
+        let length = tail.find(|c| !is_word_part(c)).unwrap_or(tail.len());
+        let word = &tail[..length];
+        let offset = text.len() - tail.len();
+        let trimmed = word.trim_end_matches(['.', ',']);
+        let inner = trimmed.trim_start_matches([',', '+']);
+        read_word(
+            text,
+            offset + (trimmed.len() - inner.len()),
+            inner,
+            &mut figures,
+        );
+        rest = &tail[length..];
     }
     figures
 }
 
-/// Whether the run of digits and dots ending at `index` starts right after a letter.
-fn run_follows_letter(chars: &[(usize, char)], index: usize) -> bool {
-    let mut k = index;
-    while k > 0 && (chars[k - 1].1.is_ascii_digit() || chars[k - 1].1 == '.') {
-        k -= 1;
+/// Read one word that starts at byte `offset` of `text`.
+fn read_word(text: &str, offset: usize, word: &str, figures: &mut Vec<Figure>) {
+    if word.is_empty() {
+        return;
     }
-    k > 0 && (chars[k - 1].1.is_alphabetic() || chars[k - 1].1 == '_')
+    if let Some(figure) = figure(text, offset, word) {
+        figures.push(figure);
+        return;
+    }
+    for (at, dash) in word.char_indices().filter(|&(_, c)| DASHES.contains(&c)) {
+        let (left, right) = (&word[..at], &word[at + dash.len_utf8()..]);
+        let right_offset = offset + at + dash.len_utf8();
+        if let (Some(a), Some(b)) = (
+            figure(text, offset, left),
+            figure(text, right_offset, right),
+        ) {
+            figures.extend([a, b]);
+            return;
+        }
+    }
+    if word.contains(',') {
+        let mut at = 0;
+        for piece in word.split(',') {
+            read_word(text, offset + at, piece, figures);
+            at += piece.len() + 1;
+        }
+    }
+}
+
+/// Read `word`, found at byte `offset` of `text`, as one figure.
+fn figure(text: &str, offset: usize, word: &str) -> Option<Figure> {
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let (negative, mut rest) = match word.strip_prefix(['-', '\u{2212}']) {
+        Some(rest) => (true, rest),
+        None => (false, word),
+    };
+
+    let mut number = String::new();
+    let whole = digits(rest);
+    number.push_str(&rest[..whole]);
+    rest = &rest[whole..];
+    while whole > 0 && rest.starts_with(',') && digits(&rest[1..]) == 3 {
+        number.push_str(&rest[1..4]);
+        rest = &rest[4..];
+    }
+    let mut decimal_places = 0;
+    if let Some(after) = rest.strip_prefix('.') {
+        decimal_places = digits(after);
+        if decimal_places > 0 {
+            number.push('.');
+            number.push_str(&after[..decimal_places]);
+            rest = &after[decimal_places..];
+        }
+    }
+    if whole == 0 && decimal_places == 0 {
+        return None;
+    }
+
+    let mut exponent = 0_i32;
+    if let Some(after) = rest.strip_prefix(['e', 'E']) {
+        let (sign, unsigned) = match after.strip_prefix(['-', '\u{2212}']) {
+            Some(unsigned) => (-1, unsigned),
+            None => (1, after.strip_prefix('+').unwrap_or(after)),
+        };
+        let n = digits(unsigned);
+        if (1..=3).contains(&n) {
+            exponent = sign * unsigned[..n].parse::<i32>().ok()?;
+            rest = &unsigned[n..];
+        }
+    }
+
+    let percent_sign = rest == "%";
+    let suffix_ok = rest.is_empty()
+        || percent_sign
+        || rest == "\u{00D7}"
+        || ((1..=3).contains(&rest.len())
+            && rest.bytes().all(|b| b.is_ascii_alphabetic())
+            && !matches!(
+                rest.to_ascii_lowercase().as_str(),
+                "st" | "nd" | "rd" | "th"
+            ));
+    if !suffix_ok {
+        return None;
+    }
+    let end = offset + word.len();
+    let percent = percent_sign || (rest.is_empty() && followed_by_points(&text[end..]));
+
+    let magnitude = if exponent == 0 {
+        format!("0{number}").parse::<f64>().ok()?
+    } else {
+        format!("0{number}e{exponent}").parse::<f64>().ok()?
+    };
+    let raw = if negative { -magnitude } else { magnitude };
+    let raw_tolerance = 0.5 * 10.0_f64.powf(f64::from(exponent) - decimal_places as f64);
+    let scale = if percent { 100.0 } else { 1.0 };
+    Some(Figure {
+        as_written: word.to_string(),
+        value: raw / scale,
+        tolerance: raw_tolerance / scale,
+        raw,
+        raw_tolerance,
+        percent,
+        measured: percent || decimal_places > 0 || exponent != 0,
+    })
 }
 
 /// Whether the text after a number starts with whitespace and the word "points", "point"
@@ -165,10 +191,6 @@ fn followed_by_points(rest: &str) -> bool {
         .collect::<String>()
         .to_lowercase();
     matches!(word.as_str(), "points" | "point" | "pp")
-}
-
-fn is_word_character(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
 }
 
 #[cfg(test)]
@@ -347,6 +369,80 @@ mod tests {
                 ("1,024", 1024.0, 0.5, 1024.0, 0.5, false),
                 ("3x", 3.0, 0.5, 3.0, 0.5, false),
                 ("0.652", 0.652, 0.0005, 0.652, 0.0005, false),
+            ],
+        );
+    }
+
+    /// One row per grammar rule: the text and the figures it yields, as written.
+    #[test]
+    fn each_word_is_read_by_the_grammar() {
+        for (text, expected) in [
+            ("71.3%", &["71.3%"][..]),
+            ("(-2).", &["-2"]),
+            ("+3.1%", &["3.1%"]),
+            ("p<0.05, n=12", &["0.05", "12"]),
+            ("1,024,", &["1,024"]),
+            (".5 and -.5", &[".5", "-.5"]),
+            ("1e-3 1.5E2 2e", &["1e-3", "1.5E2", "2e"]),
+            ("1e1234", &[]),
+            ("10-20 1.0e-3-2e-3", &["10", "20", "1.0e-3", "2e-3"]),
+            ("1,23", &["1", "23"]),
+            (
+                "12.5ms 4.2GB 3x 2.50\u{00D7}",
+                &["12.5ms", "4.2GB", "3x", "2.50\u{00D7}"],
+            ),
+            ("3rd 3xfaster 65%of 12_ r2", &[]),
+            ("v1.2.3 1.2.3 UTF-8 x86-64 Llama-3.1-8B 3-fold", &[]),
+        ] {
+            let written: Vec<String> = extract_figures(text)
+                .into_iter()
+                .map(|f| f.as_written)
+                .collect();
+            assert_eq!(written, expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn leading_dot_decimals_are_measurements() {
+        check(
+            "The score is .713 and the shift -.5.",
+            &[
+                (".713", 0.713, 0.0005, 0.713, 0.0005, false),
+                ("-.5", -0.5, 0.05, -0.5, 0.05, false),
+            ],
+        );
+        assert!(extract_figures(".713")[0].measured);
+    }
+
+    #[test]
+    fn scientific_notation_scales_value_and_precision() {
+        check(
+            "The loss is 1.0e-3 and the rate 2.5E+4, timed at 1.0ms.",
+            &[
+                ("1.0e-3", 0.001, 0.00005, 0.001, 0.00005, false),
+                ("2.5E+4", 25000.0, 500.0, 25000.0, 500.0, false),
+                ("1.0ms", 1.0, 0.05, 1.0, 0.05, false),
+            ],
+        );
+        assert!(extract_figures("1e-3")[0].measured);
+        assert!(!extract_figures("12")[0].measured);
+    }
+
+    #[test]
+    fn numbers_inside_hyphenated_identifiers_are_not_figures() {
+        check(
+            "We describe Llama-3.1-8B, GPT-4o, COVID-19 and ResNet-50-v2.",
+            &[],
+        );
+        check(
+            "Ranges 10-20, 5\u{2013}10% and 0.1-0.2 stay ranges.",
+            &[
+                ("10", 10.0, 0.5, 10.0, 0.5, false),
+                ("20", 20.0, 0.5, 20.0, 0.5, false),
+                ("5", 5.0, 0.5, 5.0, 0.5, false),
+                ("10%", 0.1, 0.005, 10.0, 0.5, true),
+                ("0.1", 0.1, 0.05, 0.1, 0.05, false),
+                ("0.2", 0.2, 0.05, 0.2, 0.05, false),
             ],
         );
     }
