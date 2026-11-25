@@ -5,6 +5,7 @@
 
 ## Abstract
 
+We study a planner for a toy research agent.
 Our planner reaches 71.3% task success on the held-out split [run:r-002].
 This is 6.1 points above the strongest baseline [exp:E1].
 The planner also halves the number of tool calls per task.

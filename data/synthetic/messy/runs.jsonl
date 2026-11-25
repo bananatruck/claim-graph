@@ -1,0 +1,16 @@
+{"kind":"note","text":"SYNTHETIC TEST DATA written by hand for Claim Graph. No run listed here happened. Records are out of order and carry extra fields on purpose."}
+{"kind":"metric","run":"m-07","name":"accuracy","value":0.739,"timestamp":"2026-11-02T10:00:00Z"}
+{"kind":"run","id":"m-07","experiment":"E12","seed":1,"status":"completed","git_sha":"0000000"}
+{"kind":"experiment","id":"E12","name":"final configuration","supersedes":"E11"}
+{"kind":"experiment","id":"E11","name":"second pilot","supersedes":"E10"}
+{"kind":"experiment","id":"E10","name":"first pilot"}
+{"kind":"run","id":"m-01","experiment":"E10","seed":1,"status":"completed"}
+{"kind":"metric","run":"m-01","name":"accuracy","value":0.7128}
+{"kind":"run","id":"m-04","experiment":"E11","seed":1,"status":"completed"}
+{"kind":"metric","run":"m-04","name":"accuracy","value":0.721}
+
+{"kind":"run","id":"m-06","experiment":"E12","seed":1,"status":"completed","variant":"plain agent"}
+{"kind":"metric","run":"m-06","name":"accuracy","value":0.695}
+{"kind":"metric","run":"m-07","name":"tool_calls_per_question","value":4.21}
+{"kind":"metric","run":"m-06","name":"tool_calls_per_question","value":6.8}
+{"kind":"run","id":"m-08","experiment":"E12","seed":2,"status":"crashed"}
