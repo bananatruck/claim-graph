@@ -422,7 +422,7 @@ fn committed_stores_match_a_rebuild_from_their_inputs() {
         let (_dir, rebuilt) = built(data);
         let expected = answers::dump(&rebuilt).unwrap();
         let actual = answers::dump(&root.join(committed)).unwrap();
-        assert_nodes_are_distinguishable(&expected, committed);
+        assert_nodes_are_distinguishable(&rebuilt, committed);
         assert_eq!(
             actual, expected,
             "{committed} is out of date; run scripts/rebuild-stores.sh"
@@ -432,12 +432,31 @@ fn committed_stores_match_a_rebuild_from_their_inputs() {
 
 /// A dump names each node by its labels and properties, so equal dumps mean the same graph
 /// only when no two nodes share both. Checked on every store the rebuild test compares.
-fn assert_nodes_are_distinguishable(dump: &[String], what: &str) {
-    let nodes: Vec<&String> = dump.iter().filter(|line| !line.contains("]->")).collect();
-    let unique: std::collections::BTreeSet<&&String> = nodes.iter().collect();
+fn assert_nodes_are_distinguishable(path: &Path, what: &str) {
+    // Read the nodes from the store itself, not by recognising node lines in the dump text,
+    // which a property value can imitate. Each is named as the dump names it: its sorted
+    // labels and its properties as a literal.
+    let db = Database::open_read_only(path.to_str().unwrap()).unwrap();
+    let mut conn = db.connect().unwrap();
+    let rows = conn
+        .query("MATCH (n) RETURN labels(n) AS labels, properties(n) AS props")
+        .unwrap()
+        .rows;
+    let names: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let relate::Value::List(labels) = &row[0] else {
+                panic!("labels: {:?}", row[0])
+            };
+            let mut labels: Vec<String> = labels.iter().map(|l| l.to_cypher_literal()).collect();
+            labels.sort();
+            format!("{} {}", labels.join(":"), row[1].to_cypher_literal())
+        })
+        .collect();
+    let unique: std::collections::BTreeSet<&String> = names.iter().collect();
     assert_eq!(
         unique.len(),
-        nodes.len(),
+        names.len(),
         "{what} has nodes with the same labels and properties; its dump cannot tell them apart"
     );
 }
@@ -446,10 +465,26 @@ fn assert_nodes_are_distinguishable(dump: &[String], what: &str) {
 /// the distinguishability check refuses to vouch for either.
 #[test]
 fn equal_dumps_vouch_for_a_graph_only_when_its_nodes_are_distinguishable() {
-    let dir = tempfile::tempdir().unwrap();
+    // A property value may hold the text of an edge line, "]->" included.
+    for value in ["1", "'x]->(:M {v: 1})'"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (dumps, paths) = equal_dump_pair(dir.path(), value);
+        assert_eq!(dumps[0], dumps[1], "the dump cannot see the difference");
+        let refused =
+            std::panic::catch_unwind(|| assert_nodes_are_distinguishable(&paths[0], "a.rl"));
+        assert!(
+            refused.is_err(),
+            "identical nodes with v = {value} went unnoticed"
+        );
+    }
+}
+
+/// Two stores that differ only in which of two identical M nodes an edge uses.
+fn equal_dump_pair(dir: &Path, value: &str) -> (Vec<Vec<String>>, Vec<PathBuf>) {
     let mut dumps = Vec::new();
+    let mut paths = Vec::new();
     for (name, second_target) in [("a.rl", "m1"), ("b.rl", "m2")] {
-        let path = dir.path().join(name);
+        let path = dir.join(name);
         let db = Database::open_with(
             path.to_str().unwrap(),
             relate::OpenOptions {
@@ -460,7 +495,7 @@ fn equal_dumps_vouch_for_a_graph_only_when_its_nodes_are_distinguishable() {
         .unwrap();
         let mut conn = db.connect().unwrap();
         conn.query(&format!(
-            "CREATE (a:F {{k: 1}}), (b:F {{k: 2}}), (m1:M {{v: 1}}), (m2:M {{v: 1}}), \
+            "CREATE (a:F {{k: 1}}), (b:F {{k: 2}}), (m1:M {{v: {value}}}), (m2:M {{v: {value}}}), \
              (a)-[:R]->(m1), (b)-[:R]->({second_target})"
         ))
         .unwrap();
@@ -468,10 +503,9 @@ fn equal_dumps_vouch_for_a_graph_only_when_its_nodes_are_distinguishable() {
         drop(conn);
         drop(db);
         dumps.push(answers::dump(&path).unwrap());
+        paths.push(path);
     }
-    assert_eq!(dumps[0], dumps[1], "the dump cannot see the difference");
-    let refused = std::panic::catch_unwind(|| assert_nodes_are_distinguishable(&dumps[0], "a.rl"));
-    assert!(refused.is_err());
+    (dumps, paths)
 }
 
 /// Built without the `parquet` feature, the store uses Relate's JSON snapshot codec,
