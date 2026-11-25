@@ -165,7 +165,18 @@ fn link_into_place(temporary: &Path, path: &Path) -> Result<(), StoreError> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(StoreError::Exists(path.to_path_buf()));
         }
-        other => other?,
+        Err(e) => {
+            // FAT and exFAT, for example, have no hard links; --replace is not a
+            // substitute, because it overwrites.
+            return Err(StoreError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot publish {}: {e}; without --replace the store is published with a hard link, so it needs a file system that supports hard links",
+                    path.display()
+                ),
+            )));
+        }
+        Ok(()) => {}
     }
     let _ = std::fs::remove_file(temporary);
     Ok(())
@@ -428,6 +439,21 @@ mod tests {
         );
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"complete store");
+    }
+
+    #[test]
+    fn a_failed_hard_link_says_publication_needs_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = link_into_place(
+            &dir.path().join("missing.rl"),
+            &dir.path().join("claims.rl"),
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("needs a file system that supports hard links"),
+            "{message}"
+        );
+        assert!(!dir.path().join("claims.rl").exists());
     }
 
     /// Two ingests without `replace` can both pass the first existence check; the one

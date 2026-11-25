@@ -39,7 +39,8 @@ enum Command {
         /// JSON Lines run log (see SPEC.md for the format).
         #[arg(long)]
         runs: PathBuf,
-        /// Relate store to create; must end in .rl.
+        /// Relate store to create; must end in .rl. Without --replace it is published with a
+        /// hard link, so its directory must be on a file system that supports hard links.
         #[arg(long)]
         store: PathBuf,
         /// Delete an existing store file at --store and rebuild it.
