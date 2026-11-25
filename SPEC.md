@@ -72,7 +72,7 @@ A list with more than one such choice, such as `1,234,5` (1,234 and 5, or 1, 234
 A leading minus sign (`-0.25`, `−3.1%`) belongs to the figure; a dash between two figures (`10-20`, `71.3%-73.9%`) is a range.
 A leading dot (`.713`) and an exponent (`1.0e-3`) are part of the number; the exponent scales both the value and the written precision.
 A unit suffix of up to three letters (`12.5ms`, `10k`, `3x`) is kept as written but does not rescale the number.
-`71.3%` and "71.3 points" (or `pp`) are on the percent scale: stored as 0.713, and as written, 71.3.
+`71.3%` and "71.3 points" (or `point`, `pp`, as a whole word, so `3 pp_score` is a count) are on the percent scale: stored as 0.713, and as written, 71.3.
 Each figure carries the precision it was written with: half a unit in its last digit.
 Value and precision must be finite, and the precision at least the smallest normal 64-bit float (about 2.2e-308) on both scales; otherwise the draft is refused, as above.
 Only percentages and numbers written with a decimal point or an exponent (`3e0` included) count as measurements; bare integers are treated as counts ("3 seeds", "2024") and never matched to metrics.
