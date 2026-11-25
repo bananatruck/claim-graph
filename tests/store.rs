@@ -799,14 +799,15 @@ fn the_roundoff_allowance_holds_at_its_edges() {
         assert_eq!(mismatched(&path), expected, "{figure} vs {metric}");
     }
 
-    // A difference with a zero baseline near the largest float.
+    // A difference near the largest float, with neither metric matching the figure directly
+    // (8e307 and 1.75e308 are both far from 9e307), so only the derivation can clear it.
     for (minuend, figure, derived) in [
-        ("9.5e307", "9e307", true),
-        ("9.5000001e307", "9e307", false),
+        ("1.75e308", "9e307", true),
+        ("1.75000001e308", "9e307", false),
     ] {
         let runs = format!(
             "{E1_RUNS}{{\"kind\":\"metric\",\"run\":\"r-1\",\"name\":\"x\",\"value\":{minuend}}}\n\
-             {{\"kind\":\"metric\",\"run\":\"r-2\",\"name\":\"x\",\"value\":0.0}}\n"
+             {{\"kind\":\"metric\",\"run\":\"r-2\",\"name\":\"x\",\"value\":8e307}}\n"
         );
         let (_dir, path) = built_from(&format!("The gap is {figure} [exp:E1].\n"), &runs);
         let expected: &[(String, String)] = if derived {
@@ -814,7 +815,23 @@ fn the_roundoff_allowance_holds_at_its_edges() {
         } else {
             &[pair("C1", figure)][..]
         };
-        assert_eq!(mismatched(&path), expected, "{minuend} - 0 vs {figure}");
+        assert_eq!(mismatched(&path), expected, "{minuend} - 8e307 vs {figure}");
+        let traces = answers::trace(&path, Some(figure), None).unwrap();
+        assert!(
+            traces[0].matches.is_empty(),
+            "{minuend}: a direct match would hide the derivation"
+        );
+        let pairs: Vec<(&str, &str, bool)> = traces[0]
+            .differences
+            .iter()
+            .map(|d| (d.minuend_run.as_str(), d.subtrahend_run.as_str(), d.cited))
+            .collect();
+        let want: &[(&str, &str, bool)] = if derived {
+            &[("r-1", "r-2", true)]
+        } else {
+            &[]
+        };
+        assert_eq!(pairs, want, "{minuend} - 8e307 vs {figure}");
     }
 }
 
