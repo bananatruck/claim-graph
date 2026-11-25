@@ -659,6 +659,17 @@ fn the_roundoff_allowance_stays_below_the_written_precision() {
     let (_dir, path) = built_from("The gap is 1000000000000.0 steps [exp:E1].\n", &runs);
     assert_eq!(mismatched(&path), [pair("C1", "1000000000000.0")]);
 
+    // Direct match with large operands: 1000000000000000.0 is written to 0.05, and the
+    // operand-relative allowance alone (about 2.0 here) would accept 1000000000000001.0,
+    // so only the cap at a millionth of the written tolerance rejects it.
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"count","value":1000000000000001.0}
+"#
+    );
+    let (_dir, path) = built_from("We reached 1000000000000000.0 steps [run:r-1].\n", &runs);
+    assert_eq!(mismatched(&path), [pair("C1", "1000000000000000.0")]);
+
     // Large operands: the difference is exactly 2.0, and 1.0 is written to 0.05, so the
     // allowance may not grow with the operands past the written precision.
     for (minuend, figure, expected) in [
