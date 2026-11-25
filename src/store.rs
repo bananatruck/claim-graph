@@ -146,13 +146,7 @@ fn publish(
         if replace {
             std::fs::rename(temporary, path)?;
         } else {
-            match std::fs::hard_link(temporary, path) {
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return Err(StoreError::Exists(path.to_path_buf()));
-                }
-                other => other?,
-            }
-            std::fs::remove_file(temporary)?;
+            link_into_place(temporary, path)?;
         }
         Ok(summary)
     });
@@ -160,6 +154,21 @@ fn publish(
         let _ = std::fs::remove_file(temporary);
     }
     result
+}
+
+/// Publish the complete store at `temporary` as `path` with a hard link, which fails
+/// atomically if `path` exists. Once the link exists the store is published, so only the
+/// link decides the result: the temporary name is a second name for the same file, and
+/// if removing it fails here, dropping the workspace directory removes it where it can.
+fn link_into_place(temporary: &Path, path: &Path) -> Result<(), StoreError> {
+    match std::fs::hard_link(temporary, path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(StoreError::Exists(path.to_path_buf()));
+        }
+        other => other?,
+    }
+    let _ = std::fs::remove_file(temporary);
+    Ok(())
 }
 
 fn build(
@@ -393,6 +402,32 @@ mod tests {
             b"another ingest's store"
         );
         assert!(!path.exists());
+    }
+
+    /// Once the hard link exists the store is published; failing to remove the temporary
+    /// name afterwards must not report the ingest as failed, or a retry without `replace`
+    /// would refuse the store this ingest just published.
+    #[cfg(unix)]
+    #[test]
+    fn publication_succeeds_once_linked_even_if_the_temporary_name_stays() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let temporary = workspace.join("store.rl");
+        std::fs::write(&temporary, b"complete store").unwrap();
+        let path = dir.path().join("claims.rl");
+        // A read-only workspace makes removing the temporary name fail after linking.
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = std::fs::remove_file(&temporary).is_err();
+        let result = link_into_place(&temporary, &path);
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            probe,
+            "the read-only workspace did not stop removal (running as root?)"
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete store");
     }
 
     /// Two ingests without `replace` can both pass the first existence check; the one
