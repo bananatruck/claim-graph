@@ -19,8 +19,8 @@
 //! suffix   = "%" | "×" | 1 to 3 ASCII letters other than st, nd, rd, th
 //! ```
 //!
-//! A figure is a measurement when it is a percentage or has a decimal point or an
-//! exponent; a bare integer is usually a count ("3 seeds", "2024").
+//! A figure is a measurement when it is a percentage or has a decimal point or a written
+//! exponent, `e0` included; a bare integer is usually a count ("3 seeds", "2024").
 
 /// A numeric token with its written precision and optional percent scaling.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +130,9 @@ fn figure(text: &str, offset: usize, word: &str) -> Option<Figure> {
         return None;
     }
 
+    // `has_exponent` records that an exponent was written, so `3e0` is a measurement.
     let mut exponent = 0_i32;
+    let mut has_exponent = false;
     if let Some(after) = rest.strip_prefix(['e', 'E']) {
         let (sign, unsigned) = match after.strip_prefix(['-', '\u{2212}']) {
             Some(unsigned) => (-1, unsigned),
@@ -139,6 +141,7 @@ fn figure(text: &str, offset: usize, word: &str) -> Option<Figure> {
         let n = digits(unsigned);
         if (1..=3).contains(&n) {
             exponent = sign * unsigned[..n].parse::<i32>().ok()?;
+            has_exponent = true;
             rest = &unsigned[n..];
         }
     }
@@ -174,7 +177,7 @@ fn figure(text: &str, offset: usize, word: &str) -> Option<Figure> {
         raw,
         raw_tolerance,
         percent,
-        measured: percent || decimal_places > 0 || exponent != 0,
+        measured: percent || decimal_places > 0 || has_exponent,
     })
 }
 
@@ -426,6 +429,17 @@ mod tests {
         );
         assert!(extract_figures("1e-3")[0].measured);
         assert!(!extract_figures("12")[0].measured);
+    }
+
+    #[test]
+    fn a_written_exponent_is_a_measurement_even_when_zero() {
+        // The grammar makes a figure with an exponent a measurement; `e0` is written.
+        check("3e0", &[("3e0", 3.0, 0.5, 3.0, 0.5, false)]);
+        assert!(extract_figures("3e0")[0].measured);
+        assert!(extract_figures("3E+0")[0].measured);
+        // No exponent: a bare integer, and `2e`, whose `e` is a unit suffix.
+        assert!(!extract_figures("3")[0].measured);
+        assert!(!extract_figures("2e")[0].measured);
     }
 
     #[test]

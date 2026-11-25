@@ -68,7 +68,7 @@ A leading dot (`.713`) and an exponent (`1.0e-3`) are part of the number; the ex
 A unit suffix of up to three letters (`12.5ms`, `10k`, `3x`) is kept as written but does not rescale the number.
 `71.3%` and "71.3 points" (or `pp`) are on the percent scale: stored as 0.713, and as written, 71.3.
 Each figure carries the precision it was written with: half a unit in its last digit.
-Only percentages and numbers written with a decimal point or an exponent count as measurements; bare integers are treated as counts ("3 seeds", "2024") and never matched to metrics.
+Only percentages and numbers written with a decimal point or an exponent (`3e0` included) count as measurements; bare integers are treated as counts ("3 seeds", "2024") and never matched to metrics.
 
 ### Run log (JSON Lines)
 
