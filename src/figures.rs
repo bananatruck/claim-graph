@@ -367,17 +367,18 @@ fn figure(text: &str, offset: usize, word: &str) -> Option<FigureRead> {
     }))
 }
 
-/// Whether the text after a number starts with whitespace and the word "points", "point"
+/// Whether the text after a number starts with whitespace and the whole word "points", "point"
 /// or "pp".
 fn followed_by_points(rest: &str) -> bool {
     let trimmed = rest.trim_start();
     if trimmed.len() == rest.len() {
         return false;
     }
-    let word: String = trimmed
-        .chars()
-        .take_while(|c| c.is_alphanumeric())
-        .collect::<String>()
+    // The next word by the module's word rule, so "pp_score" or "pp-level" is an identifier,
+    // not the unit; trailing "." and "," are punctuation, as for every word.
+    let length = trimmed.find(|c| !is_word_part(c)).unwrap_or(trimmed.len());
+    let word = trimmed[..length]
+        .trim_end_matches(['.', ','])
         .to_lowercase();
     matches!(word.as_str(), "points" | "point" | "pp")
 }
@@ -558,6 +559,24 @@ mod tests {
                 ("2", 0.02, 0.005, 2.0, 0.5, true),
             ],
         );
+        // The unit is a whole word by the same rule as every other word: an identifier that
+        // starts with "pp" or "points" is not the unit.
+        check(
+            "There are 3 pp_score entries, 4 pp-level ones and 5 points_total.",
+            &[
+                ("3", 3.0, 0.5, 3.0, 0.5, false),
+                ("4", 4.0, 0.5, 4.0, 0.5, false),
+                ("5", 5.0, 0.5, 5.0, 0.5, false),
+            ],
+        );
+        check(
+            "A gain of 3 pp, then 2.5 points.",
+            &[
+                ("3", 0.03, 0.005, 3.0, 0.5, true),
+                ("2.5", 0.025, 0.0005, 2.5, 0.05, true),
+            ],
+        );
+        assert!(!extract_figures("3 pp_score").unwrap()[0].measured);
     }
 
     #[test]

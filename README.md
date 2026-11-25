@@ -135,6 +135,8 @@ The store is an ordinary Relate store, so the `relate` CLI should open it too (`
 - Most checks follow paths of one or two hops; the unbounded traversal is the `SUPERSEDES` chain, and number matching compares every figure with every metric, which is fine for one paper and its log.
 - A store holds one draft and is rebuilt on every ingest.
 - Ingest without `--replace` publishes the store with a hard link so it can never overwrite one, so the store must go on a file system with hard links (not FAT or exFAT); `--replace` is not a workaround, because it overwrites.
+- Ingest refuses a `--store` that is one of its inputs. On Unix, where it is built and tested, that holds for any path, symbolic link or hard link to the input; elsewhere it compares canonical paths, which refuses every path to the input itself but does not detect a hard-link alias (replacing that alias leaves the input intact).
+- On Unix, `--replace` keeps the store's directory open from the start and checks the store's entry again just before replacing it, so another process changing the store path meanwhile cannot redirect it onto an input; the only remaining case needs a process that can already change the input's own directory.
 - Claim Graph does not judge whether a source says what the claim says.
 
 ## Licence

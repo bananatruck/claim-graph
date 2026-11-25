@@ -34,7 +34,7 @@ There are two datasets: `data/synthetic/` (small and tidy) and `data/synthetic/m
 
 ### Draft (Markdown)
 
-- The first `# ` heading is the draft title.
+- The first `# ` heading is the draft title; before any section it is only the title, so sentences before the first section have an empty section name.
 - A `## ` heading starts a section; the section name is stored on each sentence.
 - Lines starting with `>` (notes), `|` (table rows) and `![` (images), and deeper headings (three to six `#` followed by a space or the end of the line) are skipped; other text that starts with `#`, such as `#1 reached 74.2%` or a tab after the `#` run (`##\tResults`), is read as a sentence.
 - A line of three or more backticks opens a code fence, closed by a line of at least as many backticks and nothing else; a line that also closes its backticks is inline code, not a fence.
@@ -42,7 +42,7 @@ There are two datasets: `data/synthetic/` (small and tidy) and `data/synthetic/m
 - A fence or math block still open at the end of the draft is a parse error naming the line that opened it.
 - A number whose value or written precision a 64-bit float cannot hold (`1e-999`, `1e999`) is a parse error naming its line, because as a float it would become 0 or infinity and could match a metric it does not equal.
 - A list of numbers written without spaces that reads more than one way (`1,234,5`) is a parse error naming its line (see Figures).
-- A `# ` heading after the first one starts a new section and ends the References section.
+- Any other `# ` heading, or the title when a section has already started, starts a new section and ends the References section.
 - A paragraph is a run of non-blank lines; each list item (`- `, `* `, `1. `, `1) `) is its own paragraph.
 - A sentence ends at `.`, `!` or `?`, plus any closing brackets or quotes right after it, followed by whitespace or the end of the paragraph, so `71.3` does not split a sentence and `.)` ends one.
 - Punctuation inside a reference marker never ends a sentence.
@@ -72,7 +72,7 @@ A list with more than one such choice, such as `1,234,5` (1,234 and 5, or 1, 234
 A leading minus sign (`-0.25`, `−3.1%`) belongs to the figure; a dash between two figures (`10-20`, `71.3%-73.9%`) is a range.
 A leading dot (`.713`) and an exponent (`1.0e-3`) are part of the number; the exponent scales both the value and the written precision.
 A unit suffix of up to three letters (`12.5ms`, `10k`, `3x`) is kept as written but does not rescale the number.
-`71.3%` and "71.3 points" (or `pp`) are on the percent scale: stored as 0.713, and as written, 71.3.
+`71.3%` and "71.3 points" (or `point`, `pp`, as a whole word, so `3 pp_score` is a count) are on the percent scale: stored as 0.713, and as written, 71.3.
 Each figure carries the precision it was written with: half a unit in its last digit.
 Value and precision must be finite, and the precision at least the smallest normal 64-bit float (about 2.2e-308) on both scales; otherwise the draft is refused, as above.
 Only percentages and numbers written with a decimal point or an exponent (`3e0` included) count as measurements; bare integers are treated as counts ("3 seeds", "2024") and never matched to metrics.
@@ -130,6 +130,9 @@ The gap is a fact in the graph, so the same queries find it.
 
 Matching runs as two Cypher statements at the end of ingest, inside the same transaction.
 A measured figure `MATCHES` a metric when the metric is within the figure's written tolerance of either the scaled value or the written number, so `71.3%` matches 0.7128, 0.713 and 71.3 but not 0.714, and a plain 6.0 matches only 6.0 within 0.05.
+The comparison runs in 64-bit floats, so it allows for their roundoff and nothing more.
+A stored value is off from its decimal by at most u times its magnitude (u = 2^-53, about 1.1e-16), and the subtraction adds at most as much again, so a computed difference is within about 2.2e-16 times the sum of the operands' magnitudes of the exact one.
+The allowance is 1e-15 times each operand's magnitude, summed term by term so it cannot overflow near the largest float, and capped at a millionth of the written tolerance, so `0.30` matches 0.305 but not 0.3050001 and `9e307` matches 9.5e307 but not 9.5000001e307; a difference of two metrics uses the same rule over its three operands.
 `MATCHES` is computed across the whole log, so `trace` can show a run the claim does not cite; only matches with completed runs the claim cites count as support.
 A measured figure that no completed run the claim cites produced directly gets a `Derivation` when it equals, by the same rule, the difference between the same metric in two completed runs of an experiment the claim rests on, so "6.1 points" matches 0.713 minus 0.652.
 A difference supports the claim only when the claim reaches both runs.
@@ -207,6 +210,11 @@ When none is, it reports what those runs measured and which other claims state t
   The store is built in a temporary file beside `FILE.rl` and published only when complete. Without `--replace`, publication fails if `FILE.rl` exists by then, even when another ingest created it meanwhile; with `--replace`, the new store replaces the old one in one rename.
   Publishing without `--replace` uses a hard link, which fails atomically if `FILE.rl` exists, so `FILE.rl` must be on a file system that supports hard links; on one that does not, such as FAT or exFAT, ingest fails after building the store and leaves no store at `FILE.rl`.
   Choose a destination on a file system with hard links; `--replace` is not an equivalent workaround, because it permits overwriting an existing store.
+  Ingest refuses a `--store` that is one of its own inputs, so `--replace` does not overwrite the draft or the run log.
+  On Unix, where Claim Graph is built and tested, the check compares device and inode, so any path, symbolic link or hard link to an input is refused.
+  With `--replace`, the store's directory is held open from the start of the ingest, the store's entry in it is checked again just before the rename, and the rename replaces that entry without following a link, so another process that repoints a directory on the store path, or puts a link to an input in the store's place, cannot redirect it onto an input.
+  The one remaining case needs another process that can write to the input's own directory and moves the input into the store's place in that instant; such a process could already delete or change the input.
+  Elsewhere it compares canonical paths before building and replaces by path: every path that resolves to the input itself is refused, but a hard-link alias is not detected (replacing it replaces only that name, and the input keeps its content), and a change to the store path while the store is built is not guarded against.
 - `claim-graph unsupported --store FILE.rl [--prose] [--fail] [--format text|json]`
 - `claim-graph explain --store FILE.rl --claim C4 [--format text|json]`
 - `claim-graph trace --store FILE.rl (--figure "71.3%" | --claim C1) [--format text|json]`, with exactly one of the two selectors.
@@ -220,6 +228,7 @@ Exit status: 0 success, 1 runtime or input error, 2 usage error, 3 findings when
 
 Relate's `.rl` file is not byte-for-byte reproducible: rebuilding from the same inputs gives different bytes and the same graph.
 The committed stores are therefore checked by content: `cargo test` rebuilds both from their inputs into a temporary directory and compares the `dump` of each with the `dump` of the committed file.
+A dump names each node by its labels and properties, so the test also checks that no two nodes share both; otherwise two stores could differ in which of two identical nodes an edge uses and still dump alike.
 `scripts/rebuild-stores.sh` regenerates both stores with the documented commands.
 
 ## Limits

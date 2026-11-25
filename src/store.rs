@@ -35,6 +35,8 @@ pub enum StoreError {
     NotSingleFile(PathBuf),
     /// The store already exists and `replace` was not set.
     Exists(PathBuf),
+    /// The store path names one of the ingest's own inputs.
+    IsInput(PathBuf),
     /// There is no store at the path.
     Missing(PathBuf),
     /// The path is not valid UTF-8, which Relate's open call needs.
@@ -56,6 +58,11 @@ impl fmt::Display for StoreError {
             StoreError::Exists(p) => write!(
                 f,
                 "store already exists: {} (pass --replace to rebuild it)",
+                p.display()
+            ),
+            StoreError::IsInput(p) => write!(
+                f,
+                "{} is an input of this ingest; refusing to replace it",
                 p.display()
             ),
             StoreError::Missing(p) => write!(f, "no store at {}", p.display()),
@@ -93,6 +100,18 @@ pub fn ingest(
     log: &RunLog,
     replace: bool,
 ) -> Result<IngestSummary, StoreError> {
+    ingest_guarded(path, draft_path, draft, log, replace, &[])
+}
+
+/// `ingest` that also refuses, at the moment of replacement, to replace any of `inputs`.
+pub fn ingest_guarded(
+    path: &Path,
+    draft_path: &str,
+    draft: &Draft,
+    log: &RunLog,
+    replace: bool,
+    inputs: &[&Path],
+) -> Result<IngestSummary, StoreError> {
     store_uri(path)?;
     if path.exists() {
         if !replace {
@@ -105,6 +124,12 @@ pub fn ingest(
             )));
         }
     }
+    // The destination of a replacement is bound now, before anything is built.
+    let destination = if replace {
+        Some(Destination::open(path, inputs)?)
+    } else {
+        None
+    };
     // A fresh directory beside the store, created exclusively, holds the store while it is
     // built, so no two ingests can share a temporary path; it is removed when dropped.
     let parent = match path.parent() {
@@ -120,7 +145,7 @@ pub fn ingest(
         draft_path,
         draft,
         log,
-        replace,
+        destination.as_ref(),
     )
 }
 
@@ -128,25 +153,25 @@ pub fn ingest(
 ///
 /// Without `replace`, the store is published with a hard link, which fails atomically if
 /// `path` exists by then, so a store another ingest published meanwhile is never replaced;
-/// checking `path.exists()` again first would leave the race open. With `replace`, a rename
-/// swaps the new store in. The temporary file sits beside `path`, on the same file system.
+/// checking `path.exists()` again first would leave the race open. With `replace` (a
+/// `destination`), a rename swaps the new store in (see `replace_entry`). The temporary file
+/// sits beside `path`, on the same file system.
 fn publish(
     path: &Path,
     temporary: &Path,
     draft_path: &str,
     draft: &Draft,
     log: &RunLog,
-    replace: bool,
+    destination: Option<&Destination>,
 ) -> Result<IngestSummary, StoreError> {
     if temporary.exists() {
         // Someone else's file: report it and leave it alone.
         return Err(StoreError::Exists(temporary.to_path_buf()));
     }
     let result = build(temporary, draft_path, draft, log).and_then(|summary| {
-        if replace {
-            std::fs::rename(temporary, path)?;
-        } else {
-            link_into_place(temporary, path)?;
+        match destination {
+            Some(destination) => replace_entry(destination, temporary, || {})?,
+            None => link_into_place(temporary, path)?,
         }
         Ok(summary)
     });
@@ -154,6 +179,101 @@ fn publish(
         let _ = std::fs::remove_file(temporary);
     }
     result
+}
+
+/// Where `--replace` publishes, bound when the ingest starts: on Unix, a handle to the
+/// directory that holds the store and the entry's name in it, so a directory on the store path
+/// repointed later (by another process with write access to it) cannot redirect the
+/// replacement; and the identities of the inputs, which must never be replaced.
+pub(crate) struct Destination {
+    path: PathBuf,
+    #[cfg(unix)]
+    dir: rustix::fd::OwnedFd,
+    #[cfg(unix)]
+    name: std::ffi::OsString,
+    #[cfg(unix)]
+    inputs: Vec<(u64, u64)>,
+}
+
+impl Destination {
+    #[cfg(unix)]
+    fn open(path: &Path, inputs: &[&Path]) -> Result<Self, StoreError> {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let name = path
+            .file_name()
+            .ok_or_else(|| StoreError::NotSingleFile(path.to_path_buf()))?
+            .to_os_string();
+        let dir = rustix::fs::open(
+            parent,
+            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let inputs = inputs
+            .iter()
+            .map(|p| std::fs::metadata(p).map(|m| (m.dev(), m.ino())))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dir,
+            name,
+            inputs,
+        })
+    }
+
+    /// Only Unix is built and tested; elsewhere the replacement goes by path, after the
+    /// command line's own check.
+    #[cfg(not(unix))]
+    fn open(path: &Path, _inputs: &[&Path]) -> Result<Self, StoreError> {
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// Replace the destination entry with the complete store at `temporary`. `before` runs just
+/// before the replacement, so a test can change the file system at that point.
+///
+/// On Unix the entry is looked up again in the bound directory at the last moment, and the
+/// replacement is refused if it is, or links to, an input. The rename then replaces the
+/// directory entry itself and never writes through a link, so a link put there after that
+/// look-up is replaced, not followed. What remains: another process that can write to the
+/// input's own directory could move the input into the entry's place in that instant, but
+/// such a process can already delete or change the input itself.
+fn replace_entry(
+    destination: &Destination,
+    temporary: &Path,
+    before: impl FnOnce(),
+) -> Result<(), StoreError> {
+    before();
+    #[cfg(unix)]
+    {
+        use rustix::fs::AtFlags;
+        // `st_dev` and `st_ino` are not u64 on every Unix.
+        #[allow(clippy::unnecessary_cast)]
+        if let Ok(st) = rustix::fs::statat(&destination.dir, &destination.name, AtFlags::empty())
+            && destination
+                .inputs
+                .contains(&(st.st_dev as u64, st.st_ino as u64))
+        {
+            return Err(StoreError::IsInput(destination.path.clone()));
+        }
+        rustix::fs::renameat(
+            rustix::fs::CWD,
+            temporary,
+            &destination.dir,
+            &destination.name,
+        )
+        .map_err(std::io::Error::from)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::rename(temporary, &destination.path)?;
+    Ok(())
 }
 
 /// Publish the complete store at `temporary` as `path` with a hard link, which fails
@@ -203,7 +323,15 @@ fn build(
         return Err(StoreError::Exists(path.to_path_buf()));
     }
     let rows = rows(draft_path, draft, log);
-    let db = relate::Database::open(uri)?;
+    // The codec is pinned: otherwise RELATE_SNAPSHOT_FORMAT in the environment chooses it
+    // for a new store (relate 1.2.0, open_config.rs resolve_snapshot_codec).
+    let db = relate::Database::open_with(
+        uri,
+        relate::OpenOptions {
+            snapshot_codec: Some(relate::SnapshotCodecKind::Json),
+            ..Default::default()
+        },
+    )?;
     let mut conn = db.connect()?;
     conn.begin()?;
     for (statement, param) in queries::WRITES {
@@ -416,7 +544,7 @@ mod tests {
         std::fs::write(&temporary, b"another ingest's store").unwrap();
         let draft = parse_draft(include_str!("../data/synthetic/draft.md")).unwrap();
         let log = parse_run_log(include_str!("../data/synthetic/runs.jsonl")).unwrap();
-        let result = publish(&path, &temporary, "draft.md", &draft, &log, false);
+        let result = publish(&path, &temporary, "draft.md", &draft, &log, None);
         assert!(matches!(result, Err(StoreError::Exists(_))));
         assert_eq!(
             std::fs::read(&temporary).unwrap(),
@@ -442,6 +570,54 @@ mod tests {
         assert!(attempted);
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"complete store");
+    }
+
+    /// The input check runs before the store is built; another process with write access
+    /// to the store's directories could change them before the store is published. These
+    /// changes are made at that seam, deterministically.
+    #[cfg(unix)]
+    #[test]
+    fn a_swap_before_publication_cannot_replace_an_input() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        // The draft happens to be named like the store, in another directory.
+        let draft = b.join("claims.rl");
+        std::fs::write(&draft, b"the draft").unwrap();
+        let other_input = dir.path().join("runs.jsonl");
+        std::fs::write(&other_input, b"the run log").unwrap();
+        let link = dir.path().join("out");
+
+        // 1. A directory on the store path is repointed at the draft's directory.
+        symlink(&a, &link).unwrap();
+        let path = link.join("claims.rl");
+        let destination = Destination::open(&path, &[&draft, &other_input]).unwrap();
+        let temporary = a.join("store.tmp");
+        std::fs::write(&temporary, b"the new store").unwrap();
+        let result = replace_entry(&destination, &temporary, || {
+            std::fs::remove_file(&link).unwrap();
+            symlink(&b, &link).unwrap();
+        });
+        assert_eq!(std::fs::read(&draft).unwrap(), b"the draft", "{result:?}");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read(a.join("claims.rl")).unwrap(),
+            b"the new store"
+        );
+
+        // 2. The store entry itself becomes a link to an input: refused, input intact.
+        std::fs::remove_file(&link).unwrap();
+        symlink(&a, &link).unwrap();
+        std::fs::remove_file(a.join("claims.rl")).unwrap();
+        let destination = Destination::open(&path, &[&draft, &other_input]).unwrap();
+        std::fs::write(&temporary, b"the new store").unwrap();
+        let result = replace_entry(&destination, &temporary, || {
+            symlink(&other_input, a.join("claims.rl")).unwrap();
+        });
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(std::fs::read(&other_input).unwrap(), b"the run log");
     }
 
     #[test]
@@ -471,7 +647,7 @@ mod tests {
 
         let workspace = tempfile::tempdir_in(dir.path()).unwrap();
         let temporary = workspace.path().join("store.rl");
-        let result = publish(&path, &temporary, "draft.md", &draft, &log, false);
+        let result = publish(&path, &temporary, "draft.md", &draft, &log, None);
         assert!(
             matches!(&result, Err(StoreError::Exists(p)) if p == &path),
             "{result:?}"
@@ -482,7 +658,15 @@ mod tests {
         );
         assert!(!temporary.exists());
 
-        let replaced = publish(&path, &temporary, "draft.md", &draft, &log, true);
+        let destination = Destination::open(&path, &[]).unwrap();
+        let replaced = publish(
+            &path,
+            &temporary,
+            "draft.md",
+            &draft,
+            &log,
+            Some(&destination),
+        );
         assert!(replaced.is_ok(), "{replaced:?}");
         assert_ne!(
             std::fs::read(&path).unwrap(),

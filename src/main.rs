@@ -78,8 +78,10 @@ enum Command {
     Trace {
         #[command(flatten)]
         common: Common,
-        /// The number exactly as written in the draft, such as "71.3%" or "6.1".
-        #[arg(long)]
+        /// The number exactly as written in the draft, such as "71.3%", "6.1" or "-0.5%".
+        // Any value may start with a hyphen: figures can be negative and carry a suffix, which
+        // clap's negative-number setting would not accept ("-0.5%").
+        #[arg(long, allow_hyphen_values = true)]
         figure: Option<String>,
         /// Trace every number in one claim instead.
         #[arg(long)]
@@ -245,6 +247,24 @@ fn write_stdout(output: &str) -> Result<(), String> {
     }
 }
 
+/// Whether two paths reach one file, following symbolic links: the same device and inode.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+/// Whether two paths reach one file: the same canonical path. Only Unix is built and tested.
+/// Elsewhere this refuses every path that resolves to the input's own name, which is what
+/// replacing would destroy; a hard-link alias is not detected, and replacing it replaces only
+/// that name, so the input keeps its content. Standard Rust has no stable file-identity API
+/// for Windows, and untested code would not be a guarantee.
+#[cfg(not(unix))]
+fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
+    Ok(std::fs::canonicalize(a)? == std::fs::canonicalize(b)?)
+}
+
 fn ingest(
     draft_path: &Path,
     runs_path: &Path,
@@ -257,12 +277,28 @@ fn ingest(
         parse_draft(&read(draft_path)?).map_err(|e| format!("{}: {e}", draft_path.display()))?;
     let log =
         parse_run_log(&read(runs_path)?).map_err(|e| format!("{}: {e}", runs_path.display()))?;
-    let s = store::ingest(
+    // An ingest must never replace its own input. Compared by file identity, so the same
+    // file reached through another relative path, a symbolic link or a hard link counts.
+    if store_path.exists() {
+        for input in [draft_path, runs_path] {
+            let same =
+                same_file(store_path, input).map_err(|e| format!("{}: {e}", input.display()))?;
+            if same {
+                return Err(format!(
+                    "{} is an input of this ingest ({}); refusing to replace it",
+                    store_path.display(),
+                    input.display()
+                ));
+            }
+        }
+    }
+    let s = store::ingest_guarded(
         store_path,
         &draft_path.to_string_lossy(),
         &draft,
         &log,
         replace,
+        &[draft_path, runs_path],
     )
     .map_err(|e| e.to_string())?;
     for (claim, reference) in &s.unresolved {

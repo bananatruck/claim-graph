@@ -422,11 +422,90 @@ fn committed_stores_match_a_rebuild_from_their_inputs() {
         let (_dir, rebuilt) = built(data);
         let expected = answers::dump(&rebuilt).unwrap();
         let actual = answers::dump(&root.join(committed)).unwrap();
+        assert_nodes_are_distinguishable(&rebuilt, committed);
         assert_eq!(
             actual, expected,
             "{committed} is out of date; run scripts/rebuild-stores.sh"
         );
     }
+}
+
+/// A dump names each node by its labels and properties, so equal dumps mean the same graph
+/// only when no two nodes share both. Checked on every store the rebuild test compares.
+fn assert_nodes_are_distinguishable(path: &Path, what: &str) {
+    // Read the nodes from the store itself, not by recognising node lines in the dump text,
+    // which a property value can imitate. Each is named as the dump names it: its sorted
+    // labels and its properties as a literal.
+    let db = Database::open_read_only(path.to_str().unwrap()).unwrap();
+    let mut conn = db.connect().unwrap();
+    let rows = conn
+        .query("MATCH (n) RETURN labels(n) AS labels, properties(n) AS props")
+        .unwrap()
+        .rows;
+    let names: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let relate::Value::List(labels) = &row[0] else {
+                panic!("labels: {:?}", row[0])
+            };
+            let mut labels: Vec<String> = labels.iter().map(|l| l.to_cypher_literal()).collect();
+            labels.sort();
+            format!("{} {}", labels.join(":"), row[1].to_cypher_literal())
+        })
+        .collect();
+    let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "{what} has nodes with the same labels and properties; its dump cannot tell them apart"
+    );
+}
+
+/// Two graphs that differ only in which of two identical nodes an edge uses have equal dumps;
+/// the distinguishability check refuses to vouch for either.
+#[test]
+fn equal_dumps_vouch_for_a_graph_only_when_its_nodes_are_distinguishable() {
+    // A property value may hold the text of an edge line, "]->" included.
+    for value in ["1", "'x]->(:M {v: 1})'"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (dumps, paths) = equal_dump_pair(dir.path(), value);
+        assert_eq!(dumps[0], dumps[1], "the dump cannot see the difference");
+        let refused =
+            std::panic::catch_unwind(|| assert_nodes_are_distinguishable(&paths[0], "a.rl"));
+        assert!(
+            refused.is_err(),
+            "identical nodes with v = {value} went unnoticed"
+        );
+    }
+}
+
+/// Two stores that differ only in which of two identical M nodes an edge uses.
+fn equal_dump_pair(dir: &Path, value: &str) -> (Vec<Vec<String>>, Vec<PathBuf>) {
+    let mut dumps = Vec::new();
+    let mut paths = Vec::new();
+    for (name, second_target) in [("a.rl", "m1"), ("b.rl", "m2")] {
+        let path = dir.join(name);
+        let db = Database::open_with(
+            path.to_str().unwrap(),
+            relate::OpenOptions {
+                snapshot_codec: Some(relate::SnapshotCodecKind::Json),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut conn = db.connect().unwrap();
+        conn.query(&format!(
+            "CREATE (a:F {{k: 1}}), (b:F {{k: 2}}), (m1:M {{v: {value}}}), (m2:M {{v: {value}}}), \
+             (a)-[:R]->(m1), (b)-[:R]->({second_target})"
+        ))
+        .unwrap();
+        db.checkpoint().unwrap();
+        drop(conn);
+        drop(db);
+        dumps.push(answers::dump(&path).unwrap());
+        paths.push(path);
+    }
+    (dumps, paths)
 }
 
 /// Built without the `parquet` feature, the store uses Relate's JSON snapshot codec,
@@ -511,7 +590,13 @@ fn a_difference_needs_both_runs_cited() {
     let (_dir, path) = built_from(&draft, MESSY.runs);
     assert!(mismatched(&path).contains(&pair("C2", "4.4")));
     let traces = answers::trace(&path, Some("4.4"), None).unwrap();
-    assert!(traces[0].differences.iter().all(|d| !d.cited));
+    // trace still shows the comparison, marked as not cited.
+    let pairs: Vec<(&str, &str, bool)> = traces[0]
+        .differences
+        .iter()
+        .map(|d| (d.minuend_run.as_str(), d.subtrahend_run.as_str(), d.cited))
+        .collect();
+    assert_eq!(pairs, [("m-07", "m-06", false)]);
 }
 
 #[test]
@@ -682,6 +767,71 @@ fn the_roundoff_allowance_stays_below_the_written_precision() {
         );
         let (_dir, path) = built_from(&format!("The gap is {figure} steps [exp:E1].\n"), &runs);
         assert_eq!(mismatched(&path), expected, "{minuend}");
+    }
+}
+
+/// The matching rule at its edges: the roundoff allowance is 1e-15 of each operand's
+/// magnitude, summed term by term so that it cannot overflow, and capped at a millionth of the
+/// written tolerance.
+#[test]
+fn the_roundoff_allowance_holds_at_its_edges() {
+    for (figure, metric, matches) in [
+        // Exactly half a unit away matches; any visible distance beyond does not.
+        ("0.30", "0.305", true),
+        ("0.30", "0.3050001", false),
+        // Near the largest float: the operand sum must not overflow into accepting anything.
+        ("9e307", "9.5e307", true),
+        ("9e307", "9.5000001e307", false),
+        ("-9e307", "-9.5000001e307", false),
+        // Tiny magnitudes: no absolute allowance, so a tiny tolerance stays tiny.
+        ("1.0e-300", "1.04e-300", true),
+        ("1.0e-300", "1.06e-300", false),
+    ] {
+        let runs = format!(
+            "{E1_RUNS}{{\"kind\":\"metric\",\"run\":\"r-1\",\"name\":\"x\",\"value\":{metric}}}\n"
+        );
+        let (_dir, path) = built_from(&format!("We reached {figure} loss [run:r-1].\n"), &runs);
+        let expected: &[(String, String)] = if matches {
+            &[]
+        } else {
+            &[pair("C1", figure)][..]
+        };
+        assert_eq!(mismatched(&path), expected, "{figure} vs {metric}");
+    }
+
+    // A difference near the largest float, with neither metric matching the figure directly
+    // (8e307 and 1.75e308 are both far from 9e307), so only the derivation can clear it.
+    for (minuend, figure, derived) in [
+        ("1.75e308", "9e307", true),
+        ("1.75000001e308", "9e307", false),
+    ] {
+        let runs = format!(
+            "{E1_RUNS}{{\"kind\":\"metric\",\"run\":\"r-1\",\"name\":\"x\",\"value\":{minuend}}}\n\
+             {{\"kind\":\"metric\",\"run\":\"r-2\",\"name\":\"x\",\"value\":8e307}}\n"
+        );
+        let (_dir, path) = built_from(&format!("The gap is {figure} [exp:E1].\n"), &runs);
+        let expected: &[(String, String)] = if derived {
+            &[]
+        } else {
+            &[pair("C1", figure)][..]
+        };
+        assert_eq!(mismatched(&path), expected, "{minuend} - 8e307 vs {figure}");
+        let traces = answers::trace(&path, Some(figure), None).unwrap();
+        assert!(
+            traces[0].matches.is_empty(),
+            "{minuend}: a direct match would hide the derivation"
+        );
+        let pairs: Vec<(&str, &str, bool)> = traces[0]
+            .differences
+            .iter()
+            .map(|d| (d.minuend_run.as_str(), d.subtrahend_run.as_str(), d.cited))
+            .collect();
+        let want: &[(&str, &str, bool)] = if derived {
+            &[("r-1", "r-2", true)]
+        } else {
+            &[]
+        };
+        assert_eq!(pairs, want, "{minuend} - 8e307 vs {figure}");
     }
 }
 

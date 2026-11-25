@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Runs the demo commands in order, for recording. Run from the repository root
-# after `cargo build --release`. The pauses give a viewer time to read.
+# Runs the demo commands in order, for recording. Run from the repository root.
+# `cargo run` builds and runs the current code wherever CARGO_TARGET_DIR points.
+# The pauses give a viewer time to read.
 # The demo builds its own store under out/, so the committed stores are left as they are.
 set -euo pipefail
 
-cg=./target/release/claim-graph
+cg=(cargo run --release --locked --quiet --)
 pause=${PAUSE:-3}
 mkdir -p out
 
@@ -20,7 +21,7 @@ step() {
     fi
   done
   printf '\n'
-  "$cg" "$@"
+  "${cg[@]}" "$@"
   sleep "$pause"
 }
 

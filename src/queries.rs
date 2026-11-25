@@ -80,18 +80,26 @@ pub const WRITES: &[(&str, Option<&str>)] = &[
     ),
     // A measured figure matches a metric when the metric, rounded to the figure's written
     // precision, gives the figure, on the fraction scale or the percent scale: 71.3% matches
-    // 0.7128, 0.713 and 71.3, not 0.714. The allowance on top of the written tolerance only
-    // absorbs floating-point roundoff: a few units in the last place of the operands
-    // (1e-15 relative), and never more than a millionth of the written tolerance, so
-    // 0.0000000001 does not match 0, 1000000000000.0 does not match 1000000000001.0, and
-    // large operands cannot widen a figure past its written precision. Matches are found
-    // across the whole log, so `trace` can also show a run the claim does not cite.
+    // 0.7128, 0.713 and 71.3, not 0.714. Matches are found across the whole log, so `trace`
+    // can also show a run the claim does not cite.
+    //
+    // The rule, for decimals M and F and written tolerance T: |M - F| <= T. In floats, M and F
+    // each carry a representation error of at most u|M| and u|F| (u = 2^-53, about 1.1e-16),
+    // and the subtraction adds at most u|M - F| <= u(|M| + |F|), so the computed difference is
+    // within 2u(|M| + |F|), about 2.2e-16 (|M| + |F|), of the exact one (a difference of two
+    // metrics adds one more operand to the sum). The allowance is 1e-15 times each operand's
+    // magnitude, about four times that bound, written term by term (1e-15 * |m| + 1e-15 * |f|)
+    // so that near the largest float it cannot overflow and accept everything. It is capped at
+    // a millionth of T, so it can never widen a figure's written precision visibly: 0.30
+    // matches 0.305 but not 0.3050001, 1000000000000.0 does not match 1000000000001.0, and
+    // 9e307 matches 9.5e307 but not 9.5000001e307. A figure written with more digits than a
+    // float holds can then read as a mismatch, the safe direction.
     (
         "MATCH (f:Figure), (m:Metric) \
          WHERE f.measured \
-           AND ((abs(m.value - f.value) <= f.tolerance + 1e-15 * (abs(m.value) + abs(f.value)) \
+           AND ((abs(m.value - f.value) <= f.tolerance + 1e-15 * abs(m.value) + 1e-15 * abs(f.value) \
                  AND abs(m.value - f.value) <= f.tolerance * 1.000001) \
-                OR (abs(m.value - f.raw) <= f.raw_tolerance + 1e-15 * (abs(m.value) + abs(f.raw)) \
+                OR (abs(m.value - f.raw) <= f.raw_tolerance + 1e-15 * abs(m.value) + 1e-15 * abs(f.raw) \
                  AND abs(m.value - f.raw) <= f.raw_tolerance * 1.000001)) \
          CREATE (f)-[:MATCHES]->(m)",
         None,
@@ -99,7 +107,8 @@ pub const WRITES: &[(&str, Option<&str>)] = &[
     // A measured figure that no completed run the claim cites produced directly may be the
     // difference between two completed runs of an experiment the claim rests on, as in
     // "6.1 points above the baseline". The larger value is the minuend; equal values give
-    // one pair, ordered by run ID. The figure's sign is ignored, as in "-2.0 points".
+    // one pair, ordered by run ID. The figure's sign is ignored, as in "-2.0 points". The
+    // allowance is the same rule as above, over all three operands.
     (
         "MATCH (c:Claim)-[:STATES]->(f:Figure) \
          WHERE f.measured \
@@ -114,9 +123,9 @@ pub const WRITES: &[(&str, Option<&str>)] = &[
            AND EXISTS { MATCH (c)-[:SUPPORTED_BY]->(x) \
                         WHERE x = e OR EXISTS { MATCH (e)-[:HAS_RUN]->(x) } } \
          WITH f, r1, r2, m1, m2, m1.value - m2.value AS diff \
-         WHERE (abs(diff - abs(f.value)) <= f.tolerance + 1e-15 * (abs(m1.value) + abs(m2.value) + abs(f.value)) \
+         WHERE (abs(diff - abs(f.value)) <= f.tolerance + 1e-15 * abs(m1.value) + 1e-15 * abs(m2.value) + 1e-15 * abs(f.value) \
                 AND abs(diff - abs(f.value)) <= f.tolerance * 1.000001) \
-            OR (abs(diff - abs(f.raw)) <= f.raw_tolerance + 1e-15 * (abs(m1.value) + abs(m2.value) + abs(f.raw)) \
+            OR (abs(diff - abs(f.raw)) <= f.raw_tolerance + 1e-15 * abs(m1.value) + 1e-15 * abs(m2.value) + 1e-15 * abs(f.raw) \
                 AND abs(diff - abs(f.raw)) <= f.raw_tolerance * 1.000001) \
          CREATE (f)-[:DERIVED_AS]->(d:Derivation {op: 'difference', \
                   minuend: r1.id + ' ' + m1.name, subtrahend: r2.id + ' ' + m2.name}), \

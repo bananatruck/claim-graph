@@ -345,3 +345,139 @@ fn ingest_succeeds_when_the_reader_of_its_summary_has_gone() {
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
     assert!(store.exists());
 }
+
+/// `--replace` must never replace one of the ingest's own inputs: not by the same path, a
+/// relative path to it, or a symbolic link on either side.
+#[cfg(unix)]
+#[test]
+fn replace_refuses_a_store_path_that_names_an_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let draft_text = std::fs::read_to_string(input("data/synthetic/draft.md")).unwrap();
+    let runs_text = std::fs::read_to_string(input("data/synthetic/runs.jsonl")).unwrap();
+    let draft = dir.path().join("paper.rl");
+    let runs = dir.path().join("runs.rl");
+    std::fs::write(&draft, &draft_text).unwrap();
+    std::fs::write(&runs, &runs_text).unwrap();
+    std::os::unix::fs::symlink(&draft, dir.path().join("link.rl")).unwrap();
+    std::os::unix::fs::symlink(
+        dir.path().join("target.rl"),
+        dir.path().join("draft-link.md"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("target.rl"), &draft_text).unwrap();
+    for (draft_arg, store_arg) in [
+        ("paper.rl", "paper.rl"),
+        ("paper.rl", "./sub/../paper.rl"),
+        ("paper.rl", "runs.rl"),
+        ("paper.rl", "link.rl"),
+        ("draft-link.md", "target.rl"),
+    ] {
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        let out = Command::new(BIN)
+            .current_dir(dir.path())
+            .args([
+                "ingest",
+                "--draft",
+                draft_arg,
+                "--runs",
+                "runs.rl",
+                "--store",
+                store_arg,
+                "--replace",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{draft_arg} {store_arg}: {}",
+            text(&out.stderr)
+        );
+        assert!(
+            text(&out.stderr).contains("is an input"),
+            "{}",
+            text(&out.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&draft).unwrap(), draft_text);
+        assert_eq!(std::fs::read_to_string(&runs).unwrap(), runs_text);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target.rl")).unwrap(),
+            draft_text
+        );
+    }
+    // A store that is not an input is still replaced.
+    let out = Command::new(BIN)
+        .current_dir(dir.path())
+        .args([
+            "ingest", "--draft", "paper.rl", "--runs", "runs.rl", "--store", "out.rl",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = Command::new(BIN)
+        .current_dir(dir.path())
+        .args([
+            "ingest",
+            "--draft",
+            "paper.rl",
+            "--runs",
+            "runs.rl",
+            "--store",
+            "out.rl",
+            "--replace",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+/// The store's snapshot codec is JSON whatever Relate's environment says.
+#[test]
+fn the_snapshot_codec_does_not_follow_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("claims.rl");
+    let (draft, runs) = (
+        input("data/synthetic/draft.md"),
+        input("data/synthetic/runs.jsonl"),
+    );
+    let out = Command::new(BIN)
+        .env("RELATE_SNAPSHOT_FORMAT", "markdown")
+        .args([
+            "ingest",
+            "--draft",
+            &draft,
+            "--runs",
+            &runs,
+            "--store",
+            store.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    match relate_storage::store_info(&store).unwrap().snapshot {
+        relate_storage::StoreSnapshot::Envelope { codec, .. } => {
+            assert_eq!(codec, relate::SnapshotCodecKind::Json)
+        }
+        other => panic!("expected a JSON snapshot, found {other:?}"),
+    }
+}
+
+/// A figure value that starts with a hyphen reaches the trace in both argument forms.
+#[test]
+fn trace_accepts_a_negative_figure_as_a_separate_value() {
+    let (_dir, store) = clean_store();
+    let store = store.to_str().unwrap();
+    for figure in ["-0.5", "-0.5%"] {
+        let joined = format!("--figure={figure}");
+        let separate = run(&["trace", "--store", store, "--figure", figure]);
+        let together = run(&["trace", "--store", store, &joined]);
+        assert_eq!(
+            separate.status.code(),
+            Some(1),
+            "{}",
+            text(&separate.stderr)
+        );
+        assert_eq!(text(&separate.stderr), text(&together.stderr));
+        assert!(text(&separate.stderr).contains(&format!("states \"{figure}\"")));
+    }
+}

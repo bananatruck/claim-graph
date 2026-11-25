@@ -373,7 +373,10 @@ pub fn query(path: &Path, cypher: &str) -> Result<Table, StoreError> {
 }
 
 /// Every node and relationship as one sorted line each, independent of internal IDs.
-/// Two stores with the same dump hold the same graph.
+/// A node is named by its labels and properties, so two stores with the same dump hold the
+/// same graph when no two nodes share both; the committed-store test checks that, since two
+/// identical nodes (say, a metric record repeated in the run log) could be attached
+/// differently without changing the dump.
 pub fn dump(path: &Path) -> Result<Vec<String>, StoreError> {
     let db = open_read_only(path)?;
     let mut conn = db.connect()?;
