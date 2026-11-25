@@ -659,3 +659,20 @@ fn the_roundoff_allowance_stays_below_the_written_precision() {
     let (_dir, path) = built_from("The gap is 1000000000000.0 steps [exp:E1].\n", &runs);
     assert_eq!(mismatched(&path), [pair("C1", "1000000000000.0")]);
 }
+
+/// `audit` reads every finding through one opened store. That is safe only if an opened
+/// store keeps reading one version of the graph while a replacement is published by
+/// rename, and a second open would see the new version; this pins both.
+#[test]
+fn one_opened_store_reads_one_version_across_a_replacement() {
+    let claims = "MATCH (c:Claim) RETURN count(c)";
+    let (_dir, path) = built(&CLEAN);
+    let clean_claims = count(&path, claims);
+    let db = Database::open_read_only(path.to_str().unwrap()).unwrap();
+    let mut conn = db.connect().unwrap();
+    ingest(&MESSY, &path, true).unwrap();
+    let messy_claims = count(&path, claims);
+    assert_ne!(clean_claims, messy_claims);
+    let same_handle = conn.query(claims).unwrap().rows[0][0].as_int().unwrap();
+    assert_eq!(same_handle, clean_claims);
+}

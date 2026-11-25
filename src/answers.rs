@@ -30,7 +30,10 @@ pub struct Report {
 
 pub fn unsupported(path: &Path) -> Result<Report, StoreError> {
     let db = open_read_only(path)?;
-    let mut conn = db.connect()?;
+    report(&mut db.connect()?)
+}
+
+fn report(conn: &mut relate::Connection) -> Result<Report, StoreError> {
     let total = conn.query(queries::CLAIM_TOTAL)?;
     let total_claims = int(first(&total.rows, "claim total")?, "n")?;
     let listed = |rows: &[Vec<relate::Value>]| -> Result<Vec<Listed>, StoreError> {
@@ -330,10 +333,12 @@ impl Audit {
     }
 }
 
+/// Every finding, all read through one opened store, so a store replaced while the audit
+/// runs cannot mix findings from two versions of the graph.
 pub fn audit(path: &Path) -> Result<Audit, StoreError> {
-    let report = unsupported(path)?;
     let db = open_read_only(path)?;
     let mut conn = db.connect()?;
+    let report = report(&mut conn)?;
     let broken = links(&mut conn, None, true)?;
     let stale = stale(&mut conn, None)?;
     let mismatches = mismatches(&mut conn, None)?;
