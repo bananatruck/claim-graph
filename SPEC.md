@@ -210,9 +210,11 @@ When none is, it reports what those runs measured and which other claims state t
   The store is built in a temporary file beside `FILE.rl` and published only when complete. Without `--replace`, publication fails if `FILE.rl` exists by then, even when another ingest created it meanwhile; with `--replace`, the new store replaces the old one in one rename.
   Publishing without `--replace` uses a hard link, which fails atomically if `FILE.rl` exists, so `FILE.rl` must be on a file system that supports hard links; on one that does not, such as FAT or exFAT, ingest fails after building the store and leaves no store at `FILE.rl`.
   Choose a destination on a file system with hard links; `--replace` is not an equivalent workaround, because it permits overwriting an existing store.
-  Ingest refuses a `--store` that is one of its own inputs, so `--replace` can never overwrite the draft or the run log.
+  Ingest refuses a `--store` that is one of its own inputs, so `--replace` does not overwrite the draft or the run log.
   On Unix, where Claim Graph is built and tested, the check compares device and inode, so any path, symbolic link or hard link to an input is refused.
-  Elsewhere it compares canonical paths: every path that resolves to the input itself is refused, but a hard-link alias is not detected (replacing it replaces only that name, and the input keeps its content).
+  With `--replace`, the store's directory is held open from the start of the ingest, the store's entry in it is checked again just before the rename, and the rename replaces that entry without following a link, so another process that repoints a directory on the store path, or puts a link to an input in the store's place, cannot redirect it onto an input.
+  The one remaining case needs another process that can write to the input's own directory and moves the input into the store's place in that instant; such a process could already delete or change the input.
+  Elsewhere it compares canonical paths before building and replaces by path: every path that resolves to the input itself is refused, but a hard-link alias is not detected (replacing it replaces only that name, and the input keeps its content), and a change to the store path while the store is built is not guarded against.
 - `claim-graph unsupported --store FILE.rl [--prose] [--fail] [--format text|json]`
 - `claim-graph explain --store FILE.rl --claim C4 [--format text|json]`
 - `claim-graph trace --store FILE.rl (--figure "71.3%" | --claim C1) [--format text|json]`, with exactly one of the two selectors.

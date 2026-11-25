@@ -292,12 +292,13 @@ fn ingest(
             }
         }
     }
-    let s = store::ingest(
+    let s = store::ingest_guarded(
         store_path,
         &draft_path.to_string_lossy(),
         &draft,
         &log,
         replace,
+        &[draft_path, runs_path],
     )
     .map_err(|e| e.to_string())?;
     for (claim, reference) in &s.unresolved {

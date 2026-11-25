@@ -147,6 +147,7 @@ dependencies = [
  "clap",
  "relate",
  "relate-storage",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
