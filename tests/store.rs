@@ -658,6 +658,20 @@ fn the_roundoff_allowance_stays_below_the_written_precision() {
     );
     let (_dir, path) = built_from("The gap is 1000000000000.0 steps [exp:E1].\n", &runs);
     assert_eq!(mismatched(&path), [pair("C1", "1000000000000.0")]);
+
+    // Large operands: the difference is exactly 2.0, and 1.0 is written to 0.05, so the
+    // allowance may not grow with the operands past the written precision.
+    for (minuend, figure, expected) in [
+        ("1000000000000002.0", "1.0", &[pair("C1", "1.0")][..]),
+        ("1000000000000001.0", "1.0", &[]),
+    ] {
+        let runs = format!(
+            "{E1_RUNS}{{\"kind\":\"metric\",\"run\":\"r-1\",\"name\":\"count\",\"value\":{minuend}}}\n\
+             {{\"kind\":\"metric\",\"run\":\"r-2\",\"name\":\"count\",\"value\":1000000000000000.0}}\n"
+        );
+        let (_dir, path) = built_from(&format!("The gap is {figure} steps [exp:E1].\n"), &runs);
+        assert_eq!(mismatched(&path), expected, "{minuend}");
+    }
 }
 
 /// `audit` reads every finding through one opened store. That is safe only if an opened
