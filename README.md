@@ -134,6 +134,7 @@ The store is an ordinary Relate store, so the `relate` CLI should open it too (`
 - A difference is recognised only between two completed runs of one experiment the claim rests on.
 - Most checks follow paths of one or two hops; the unbounded traversal is the `SUPERSEDES` chain, and number matching compares every figure with every metric, which is fine for one paper and its log.
 - A store holds one draft and is rebuilt on every ingest.
+- Ingest without `--replace` publishes the store with a hard link so it can never overwrite one, so the store must go on a file system with hard links (not FAT or exFAT); `--replace` is not a workaround, because it overwrites.
 - Claim Graph does not judge whether a source says what the claim says.
 
 ## Licence

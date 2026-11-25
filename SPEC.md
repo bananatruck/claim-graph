@@ -2,7 +2,7 @@
 
 ## The idea in one sentence
 
-Claim Graph reads a research agent's paper draft and its run log into a single-file Relate graph and reports every checkable claim that has no path to a completed run or a listed source, every reference that fails on an otherwise supported claim, every claim that rests on a superseded experiment, and every measured figure (a percentage or a decimal) in a claim resting on completed runs that those runs did not produce.
+Claim Graph reads a research agent's paper draft and its run log into a single-file Relate graph and reports every checkable claim that has no path to a completed run or a listed source, every reference that fails on an otherwise supported claim, every claim that rests on a superseded experiment, and every measured figure (a percentage, a decimal or a number with an exponent) in a claim resting on completed runs that those runs did not produce.
 Bare integers, numbers in claims supported only by citations, and sentences the claim rule leaves as prose are not checked against metrics.
 
 ## User and problem
@@ -36,10 +36,12 @@ There are two datasets: `data/synthetic/` (small and tidy) and `data/synthetic/m
 
 - The first `# ` heading is the draft title.
 - A `## ` heading starts a section; the section name is stored on each sentence.
-- Lines starting with `>` (notes), `|` (table rows) and `![` (images), and deeper headings are skipped.
+- Lines starting with `>` (notes), `|` (table rows) and `![` (images), and deeper headings (three to six `#` followed by a space or the end of the line) are skipped; other text that starts with `#`, such as `#1 reached 74.2%` or a tab after the `#` run (`##\tResults`), is read as a sentence.
 - A line of three or more backticks opens a code fence, closed by a line of at least as many backticks and nothing else; a line that also closes its backticks is inline code, not a fence.
 - A line starting with `$$` opens a math block, closed by a line that starts or ends with `$$`; `$$ ... $$` on one line is removed and the rest of the line kept.
 - A fence or math block still open at the end of the draft is a parse error naming the line that opened it.
+- A number whose value or written precision a 64-bit float cannot hold (`1e-999`, `1e999`) is a parse error naming its line, because as a float it would become 0 or infinity and could match a metric it does not equal.
+- A list of numbers written without spaces that reads more than one way (`1,234,5`) is a parse error naming its line (see Figures).
 - A `# ` heading after the first one starts a new section and ends the References section.
 - A paragraph is a run of non-blank lines; each list item (`- `, `* `, `1. `, `1) `) is its own paragraph.
 - A sentence ends at `.`, `!` or `?`, plus any closing brackets or quotes right after it, followed by whitespace or the end of the paragraph, so `71.3` does not split a sentence and `.)` ends one.
@@ -60,12 +62,20 @@ It errs towards checking: a sentence such as "Fig. 3 shows the error rate" count
 
 ### Figures
 
-A figure is a number in a claim, outside reference markers, and not part of an identifier: `r2`, `v1.2.3`, `1.2.3`, `gpt-3.5-turbo`, `UTF-8` and `3rd` are not figures.
-A leading minus sign (`-0.25`, `−3.1%`) belongs to the figure; a hyphen between two numbers (`10-20`) is a range.
+A figure is a number in a claim, outside reference markers.
+The text is read as whole words, and the grammar in `src/figures.rs` decides whether a word is a figure, a range of two figures, a comma list written without spaces, or an identifier holding none.
+So `r2`, `v1.2.3`, `1.2.3`, `gpt-3.5-turbo`, `UTF-8`, `x86-64`, `Llama-3.1-8B` and `3rd` are not figures.
+In a list written without spaces, each comma is a list comma or a thousands separator, and an item does not start with `0` and another digit.
+The one choice that makes every item read is the list: `1,23` is 1 and 23, `1,024.5,2.5` is 1,024.5 and 2.5, and `1.5-2,000.5,3.5` is 1.5, 2,000.5 and 3.5.
+A word that reads as one figure or a range is never a list, so `1,500` is 1,500 and `0.5-1,500` is 0.5 and 1,500.
+A list with more than one such choice, such as `1,234,5` (1,234 and 5, or 1, 234 and 5), is a parse error naming its line, so no reading is picked that might match a metric; a list with none is an identifier.
+A leading minus sign (`-0.25`, `−3.1%`) belongs to the figure; a dash between two figures (`10-20`, `71.3%-73.9%`) is a range.
+A leading dot (`.713`) and an exponent (`1.0e-3`) are part of the number; the exponent scales both the value and the written precision.
 A unit suffix of up to three letters (`12.5ms`, `10k`, `3x`) is kept as written but does not rescale the number.
 `71.3%` and "71.3 points" (or `pp`) are on the percent scale: stored as 0.713, and as written, 71.3.
 Each figure carries the precision it was written with: half a unit in its last digit.
-Only percentages and numbers written with decimals count as measurements; bare integers are treated as counts ("3 seeds", "2024") and never matched to metrics.
+Value and precision must be finite, and the precision at least the smallest normal 64-bit float (about 2.2e-308) on both scales; otherwise the draft is refused, as above.
+Only percentages and numbers written with a decimal point or an exponent (`3e0` included) count as measurements; bare integers are treated as counts ("3 seeds", "2024") and never matched to metrics.
 
 ### Run log (JSON Lines)
 
@@ -194,6 +204,9 @@ When none is, it reports what those runs measured and which other claims state t
 ## Command-line surface
 
 - `claim-graph ingest --draft FILE --runs FILE --store FILE.rl [--replace]`
+  The store is built in a temporary file beside `FILE.rl` and published only when complete. Without `--replace`, publication fails if `FILE.rl` exists by then, even when another ingest created it meanwhile; with `--replace`, the new store replaces the old one in one rename.
+  Publishing without `--replace` uses a hard link, which fails atomically if `FILE.rl` exists, so `FILE.rl` must be on a file system that supports hard links; on one that does not, such as FAT or exFAT, ingest fails after building the store and leaves no store at `FILE.rl`.
+  Choose a destination on a file system with hard links; `--replace` is not an equivalent workaround, because it permits overwriting an existing store.
 - `claim-graph unsupported --store FILE.rl [--prose] [--fail] [--format text|json]`
 - `claim-graph explain --store FILE.rl --claim C4 [--format text|json]`
 - `claim-graph trace --store FILE.rl (--figure "71.3%" | --claim C1) [--format text|json]`, with exactly one of the two selectors.
@@ -228,7 +241,7 @@ The committed stores are therefore checked by content: `cargo test` rebuilds bot
 
 - Draft parser: title, sections, sentence splitting around decimals and abbreviations, notes, tables, images, code and math skipped, all list styles, all reference forms, figures outside markers only, malformed references with their line numbers.
 - Claim rule: each reason on its own, plain prose, whole-word matching, numbers inside identifiers.
-- Figures: percentages, points, decimals, integers, signs, ranges, thousands separators, multipliers, unit suffixes, ordinals, dotted and hyphenated identifiers.
+- Figures: one table row per grammar rule, plus percentages, points, decimals with and without a leading digit, exponents, integers, signs, ranges, thousands separators, multipliers, unit suffixes, ordinals, dotted and hyphenated identifiers.
 - Run log: each kind, any order, extra fields, `supersedes`, cycles, IDs a draft cannot reference, duplicates, dangling references, invalid JSON.
 - Store, on real `.rl` files reopened read-only: node and relationship counts, unsupported claims and prose, a report that changes when the graph is edited directly, `explain` reasons and paths, `trace` matches, differences and the no-source case, stale chains, mismatches, broken references on supported claims, each trigger input from the first review round, read-only `query`, refusal to overwrite, replacement without leftovers, the path rule, and a missing store.
 - The committed stores match a rebuild by content, and are single-file bundles with the JSON codec.

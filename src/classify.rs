@@ -123,7 +123,8 @@ pub const COMPARISON_WORDS: &[&str] = &[
 /// An empty result means the sentence is prose.
 pub fn classify(text: &str, has_citation: bool, has_run_or_experiment: bool) -> Vec<Reason> {
     let mut reasons = Vec::new();
-    if !extract_figures(text).is_empty() {
+    // A number a float cannot hold is still a number; the parser reports it.
+    if extract_figures(text).map_or(true, |figures| !figures.is_empty()) {
         reasons.push(Reason::Number);
     }
     // Digits and underscores stay inside a token, so `Match3` and `match_score` are

@@ -5,7 +5,7 @@
 use std::fmt;
 
 use crate::classify::{Reason, classify};
-use crate::figures::{Figure, extract_figures};
+use crate::figures::{Figure, Problem, extract_figures};
 
 /// A parsed draft: its title, its sentences in reading order, and its bibliography.
 #[derive(Debug, Clone, PartialEq)]
@@ -207,7 +207,7 @@ impl Parser {
             self.section = heading.trim().to_string();
             self.in_references = self.section.eq_ignore_ascii_case("references");
         } else if trimmed.is_empty()
-            || trimmed.starts_with('#')
+            || is_atx_heading(trimmed)
             || trimmed.starts_with('>')
             || trimmed.starts_with('|')
             || trimmed.starts_with("![")
@@ -257,6 +257,19 @@ impl Parser {
                 line: paragraph.line_at(start + offset),
                 message,
             })?;
+            let figures = extract_figures(&refs.plain).map_err(|e| ParseError {
+                line: paragraph.line_at(start + refs.sentence_offset(e.offset)),
+                message: match e.problem {
+                    Problem::Unrepresentable => format!(
+                        "the number `{}` cannot be held with its written precision by a 64-bit float, so it cannot be checked",
+                        e.as_written
+                    ),
+                    Problem::Ambiguous => format!(
+                        "`{}` cannot be read as one list of numbers; write a space after each list comma",
+                        e.as_written
+                    ),
+                },
+            })?;
             let reasons = classify(
                 &refs.plain,
                 !refs.citations.is_empty(),
@@ -277,7 +290,7 @@ impl Parser {
                 citations: refs.citations,
                 runs: refs.runs,
                 experiments: refs.experiments,
-                figures: extract_figures(&refs.plain),
+                figures,
                 reasons,
             });
         }
@@ -403,6 +416,20 @@ struct References {
     experiments: Vec<String>,
     /// The sentence with every reference marker replaced by a space.
     plain: String,
+    /// `(offset in plain, offset in the sentence)` where each copied stretch of `plain`
+    /// starts, in increasing order; a marker's space maps to the marker's `[`.
+    segments: Vec<(usize, usize)>,
+}
+
+impl References {
+    /// The byte offset in the sentence of byte `offset` of `plain`.
+    fn sentence_offset(&self, offset: usize) -> usize {
+        self.segments
+            .iter()
+            .rev()
+            .find(|(plain, _)| *plain <= offset)
+            .map_or(offset, |(plain, sentence)| sentence + (offset - plain))
+    }
 }
 
 /// Find `[@key; @key]` (or comma-separated), `[run:ID]` and `[exp:ID]` markers.
@@ -459,11 +486,14 @@ fn extract_references(sentence: &str) -> Result<References, (usize, String)> {
                 list.push(id.to_string());
             }
         }
+        refs.segments.push((refs.plain.len(), copied_to));
         refs.plain.push_str(&sentence[copied_to..open]);
+        refs.segments.push((refs.plain.len(), open));
         refs.plain.push(' ');
         search_from = open + 1 + close + 1;
         copied_to = search_from;
     }
+    refs.segments.push((refs.plain.len(), copied_to));
     refs.plain.push_str(&sentence[copied_to..]);
     Ok(refs)
 }
@@ -479,6 +509,14 @@ pub(crate) fn is_identifier(text: &str) -> bool {
         && text
             .chars()
             .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+/// A heading: one to six `#` followed by a space or the end of the line, as SPEC.md
+/// defines headings. Other text that starts with `#` ("#1 reached 74.2%", "##\tResults")
+/// is ordinary text, so it is checked rather than dropped.
+fn is_atx_heading(line: &str) -> bool {
+    let level = line.bytes().take_while(|&b| b == b'#').count();
+    (1..=6).contains(&level) && matches!(line.as_bytes().get(level), None | Some(b' '))
 }
 
 #[cfg(test)]
@@ -564,6 +602,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(texts(&draft), ["A claim with 4 parts."]);
+    }
+
+    #[test]
+    fn only_atx_headings_are_skipped_and_hash_text_is_a_sentence() {
+        let draft = parse_draft(
+            "# Title\n\n### Results\n\n#### Detail\n\n#1 reached 74.2% [run:r].\n\n#hashtag runs gave 3 wins.\n\n###\n\nLast claim has 2 parts.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            texts(&draft),
+            [
+                "#1 reached 74.2% [run:r].",
+                "#hashtag runs gave 3 wins.",
+                "Last claim has 2 parts."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_number_a_float_cannot_hold_is_a_parse_error_at_its_line() {
+        let error =
+            parse_draft("## Results\n\nThe run is stable.\nWe reached 1e-999 loss [run:r-1].\n")
+                .unwrap_err();
+        assert_eq!(error.line, 4, "{error}");
+        assert!(error.message.contains("`1e-999`"), "{error}");
+    }
+
+    #[test]
+    fn an_ambiguous_list_of_numbers_is_a_parse_error_at_its_line() {
+        let error = parse_draft("Seeds 1,2 and\nscores 1,234,5 [run:r].\n").unwrap_err();
+        assert_eq!(error.line, 2, "{error}");
+        assert!(error.message.contains("`1,234,5`"), "{error}");
+    }
+
+    #[test]
+    fn a_rejected_number_is_reported_where_it_stands_not_where_its_text_first_appears() {
+        // `v1e-999` is an identifier and the marker holds no figure; only line 3 is rejected.
+        for draft in [
+            "Model v1e-999 is stable and\nloss is\n1e-999.\n",
+            "We cite [run:r1e-999] here and\nloss is\n1e-999.\n",
+        ] {
+            let error = parse_draft(draft).unwrap_err();
+            assert_eq!(error.line, 3, "{draft:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_tab_after_hashes_is_not_a_heading() {
+        // SPEC: a heading's `#` run is followed by a space or the end of the line, so a
+        // tab-separated line is a sentence, kept and checked rather than dropped.
+        let draft = parse_draft("## Results\n\n##\tTuned run reached 74.2% [run:r].\n").unwrap();
+        assert_eq!(texts(&draft), ["##\tTuned run reached 74.2% [run:r]."]);
+        assert_eq!(draft.sentences[0].section, "Results");
+        assert!(draft.sentences[0].is_claim());
+
+        // Inside References it is not a heading either, so it is reported at its own line.
+        let error =
+            parse_draft("## References\n- [@a] One.\n##\tAppendix\nWe add 1 note.\n").unwrap_err();
+        assert_eq!(error.line, 3, "{error}");
     }
 
     #[test]

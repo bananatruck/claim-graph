@@ -1,4 +1,44 @@
 //! Numbers stated in a sentence, with the precision they were written with.
+//!
+//! The text is read as words, and each whole word either is a figure or holds none.
+//! A word is a maximal run of letters, digits, `_`, `.`, `,`, `+`, `%`, `×` and the
+//! dashes `-`, `−` (minus sign) and `–` (en dash); any other character separates words.
+//! Trailing `.` and `,` and leading `,` and `+` are punctuation, not part of the word.
+//! A word is then read by this grammar, first rule that fits:
+//!
+//! ```text
+//! word     = figure                 one figure
+//!          | figure dash figure     a range: two figures ("10-20", "71.3%-73.9%")
+//!          | item ("," item)+       a list written without spaces ("1,23" is 1 and 23)
+//!          | anything else          no figure: an identifier such as v1.2.3, UTF-8,
+//!                                   gpt-3.5-turbo, x86-64 or Llama-3.1-8B
+//! item     = figure | figure dash figure | identifier without ","
+//!                                   where no figure starts with 0 and another digit
+//! figure   = sign? number exponent? suffix?
+//! sign     = "-" | "−"
+//! number   = digits ("," 3 digits)* ("." digits)? | "." digits
+//! exponent = ("e" | "E") ("-" | "+" | "−")? 1 to 3 digits
+//! suffix   = "%" | "×" | 1 to 3 ASCII letters other than st, nd, rd, th
+//! ```
+//!
+//! Each comma of a list is either a list comma or a thousands separator inside a figure.
+//! When exactly one choice makes every item read, that is the list ("1,024.5,2.5" is
+//! 1,024.5 and 2.5, because `024.5` is not an item; "1.5-2,000.5,3.5" is 1.5, 2,000.5 and
+//! 3.5). When no choice does, the word is an identifier. When more than one does
+//! ("1,234,5" is 1,234 and 5, or 1, 234 and 5), the word is ambiguous and is an error,
+//! so the draft is refused rather than one reading picked that might match a metric.
+//! A run of more than 64 commas that are each followed by three digits is refused too.
+//! A word that reads as one figure or a range is never a list ("1,500" is 1,500, and
+//! "0.5-1,500" is 0.5 and 1,500).
+//!
+//! A figure whose value or written precision a 64-bit float cannot hold, such as `1e-999`
+//! (both would become 0 and match a metric of 0) or `1e999` (infinite), is an error, so
+//! the draft is refused rather than the number read as a value it does not have. The
+//! value and the precision must be finite, and the precision a normal float, at least
+//! about 2.2e-308, on both the written and the percent scale.
+//!
+//! A figure is a measurement when it is a percentage or has a decimal point or a written
+//! exponent, `e0` included; a bare integer is usually a count ("3 seeds", "2024").
 
 /// A numeric token with its written precision and optional percent scaling.
 #[derive(Debug, Clone, PartialEq)]
@@ -16,140 +56,315 @@ pub struct Figure {
     pub raw_tolerance: f64,
     /// Written with `%`, or followed by the word "points", "point" or "pp".
     pub percent: bool,
+    /// A percentage, or written with a decimal point or an exponent.
+    pub measured: bool,
 }
 
-/// Extract numeric tokens in order, excluding numbers that are part of identifiers
-/// (`r2`, `v1.2.3`, `gpt-3.5-turbo`, `UTF-8`), ordinals (`3rd`) and long glued suffixes.
-/// A short unit suffix of up to three ASCII letters (`12.5ms`, `10k`, `3x`) is kept in
-/// `as_written` and does not change the value.
-pub fn extract_figures(text: &str) -> Vec<Figure> {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let at = |i: usize| chars.get(i).map(|&(_, c)| c);
-    let byte = |i: usize| chars.get(i).map_or(text.len(), |&(b, _)| b);
-    let digits_from = |mut i: usize| {
-        let begin = i;
-        while at(i).is_some_and(|c| c.is_ascii_digit()) {
-            i += 1;
+/// A word the grammar makes numeric but that cannot be read as figures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FigureError {
+    /// The figure or list as written.
+    pub as_written: String,
+    /// Its byte offset in the text given to `extract_figures`.
+    pub offset: usize,
+    pub problem: Problem,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Problem {
+    /// A 64-bit float cannot hold its value or written precision.
+    Unrepresentable,
+    /// A list written without spaces that reads as figures in more than one way, or has
+    /// more than `MAX_LIST_COMMAS` possible thousands separators in a row.
+    Ambiguous,
+}
+
+/// The most commas in a row, each followed by three digits, that a list written without
+/// spaces may have; reading them is quadratic in their number, so a longer run is refused
+/// rather than read slowly.
+const MAX_LIST_COMMAS: usize = 64;
+
+const DASHES: [char; 3] = ['-', '\u{2212}', '\u{2013}'];
+
+fn is_word_part(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(c, '_' | '.' | ',' | '+' | '%' | '\u{00D7}')
+        || DASHES.contains(&c)
+}
+
+/// Extract the figures of `text` in order, by the grammar in the module documentation,
+/// or the first word that cannot be read as figures.
+pub fn extract_figures(text: &str) -> Result<Vec<Figure>, FigureError> {
+    let mut figures = Vec::new();
+    let mut rest = text;
+    while let Some(begin) = rest.find(is_word_part) {
+        let tail = &rest[begin..];
+        let length = tail.find(|c| !is_word_part(c)).unwrap_or(tail.len());
+        let word = &tail[..length];
+        let offset = text.len() - tail.len();
+        let trimmed = word.trim_end_matches(['.', ',']);
+        let inner = trimmed.trim_start_matches([',', '+']);
+        read_word(
+            text,
+            offset + (trimmed.len() - inner.len()),
+            inner,
+            &mut figures,
+        );
+        rest = &tail[length..];
+    }
+    figures.into_iter().collect()
+}
+
+type FigureRead = Result<Figure, FigureError>;
+
+/// Read one word that starts at byte `offset` of `text`.
+fn read_word(text: &str, offset: usize, word: &str, figures: &mut Vec<FigureRead>) {
+    if word.is_empty() {
+        return;
+    }
+    if let Some(found) = figure_or_range(text, offset, word) {
+        figures.extend(found);
+        return;
+    }
+    if !word.contains(',') {
+        return;
+    }
+    match list_commas(text, offset, word) {
+        Some(Lists::One(commas)) => {
+            let mut start = 0;
+            for end in commas.into_iter().chain([word.len()]) {
+                let item = &word[start..end];
+                figures.extend(figure_or_range(text, offset + start, item).unwrap_or_default());
+                start = end + 1;
+            }
         }
-        i - begin
+        Some(Lists::None) => {}
+        None => figures.push(Err(FigureError {
+            as_written: word.to_string(),
+            offset,
+            problem: Problem::Ambiguous,
+        })),
+    }
+}
+
+/// `word` read as one figure, or as a range of two: `None` when neither rule fits.
+fn figure_or_range(text: &str, offset: usize, word: &str) -> Option<Vec<FigureRead>> {
+    if let Some(figure) = figure(text, offset, word) {
+        return Some(vec![figure]);
+    }
+    word.char_indices()
+        .filter(|&(_, c)| DASHES.contains(&c))
+        .find_map(|(at, dash)| {
+            let right = at + dash.len_utf8();
+            Some(vec![
+                figure(text, offset, &word[..at])?,
+                figure(text, offset + right, &word[right..])?,
+            ])
+        })
+}
+
+/// How many ways a word reads as a list.
+enum Lists {
+    /// No way: the word is an identifier.
+    None,
+    /// One way, with these list commas.
+    One(Vec<usize>),
+}
+
+/// The list commas of `word` read as `item ("," item)+`, or `None` when more than one
+/// choice of list commas makes every item read (see the module documentation).
+///
+/// A thousands separator is always followed by exactly three digits and then no digit,
+/// so every other comma is a list comma. Those split the word into stretches that are
+/// read independently: the word has one reading only when each stretch has one.
+fn list_commas(text: &str, offset: usize, word: &str) -> Option<Lists> {
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let commas: Vec<usize> = word.match_indices(',').map(|(at, _)| at).collect();
+    let whole_excluded = commas.iter().all(|&at| digits(&word[at + 1..]) == 3);
+    // One pass: possible thousands separators gather into the current stretch, and each
+    // forced list comma, or the end of the word, closes it.
+    let mut chosen = Vec::new();
+    let mut ambiguous = false;
+    let mut inside = Vec::new();
+    let mut low = 0;
+    for at in commas.into_iter().map(Some).chain([None]) {
+        let high = match at {
+            Some(at) if digits(&word[at + 1..]) == 3 => {
+                inside.push(at);
+                continue;
+            }
+            Some(at) => at,
+            None => word.len(),
+        };
+        match stretch_commas(text, offset, word, low, high, &inside, whole_excluded) {
+            Some(Lists::None) => return Some(Lists::None),
+            Some(Lists::One(found)) => chosen.extend(found),
+            None => ambiguous = true,
+        }
+        chosen.extend(at);
+        inside.clear();
+        low = high + 1;
+    }
+    if ambiguous {
+        return None;
+    }
+    chosen.sort_unstable();
+    Some(Lists::One(chosen))
+}
+
+/// The list commas among `commas` of the stretch `word[low..high]`, each of them possibly
+/// a thousands separator; `None` when more than one choice reads. With `whole_excluded`
+/// the stretch is the whole word, which needs at least one list comma.
+fn stretch_commas(
+    text: &str,
+    offset: usize,
+    word: &str,
+    low: usize,
+    high: usize,
+    commas: &[usize],
+    whole_excluded: bool,
+) -> Option<Lists> {
+    if commas.len() > MAX_LIST_COMMAS {
+        return None;
+    }
+    let k = commas.len();
+    let start = |i: usize| if i == 0 { low } else { commas[i - 1] + 1 };
+    let end = |j: usize| if j == k { high } else { commas[j] };
+    let allowed = |i: usize, j: usize| !(whole_excluded && i == 0 && j == k);
+    // Whether word[start(i)..end(j)] is an item.
+    let item = |i: usize, j: usize| {
+        let piece = &word[start(i)..end(j)];
+        match figure_or_range(text, offset + start(i), piece) {
+            Some(found) => found.iter().all(|f| {
+                let written = match f {
+                    Ok(f) => &f.as_written,
+                    Err(e) => &e.as_written,
+                };
+                let digits = written.trim_start_matches(['-', '\u{2212}']).as_bytes();
+                !(digits.len() > 1 && digits[0] == b'0' && digits[1].is_ascii_digit())
+            }),
+            None => !piece.contains(','),
+        }
+    };
+    // ways[i]: the readings of word[start(i)..high] as items, capped at 2.
+    let mut ways = vec![0_u8; k + 1];
+    for i in (0..=k).rev() {
+        let mut n = 0;
+        for j in i..=k {
+            if allowed(i, j) && item(i, j) {
+                n += if j == k { 1 } else { ways[j + 1] };
+            }
+        }
+        ways[i] = n.min(2);
+    }
+    match ways[0] {
+        0 => Some(Lists::None),
+        1 => {
+            let mut chosen = Vec::new();
+            let mut i = 0;
+            while i <= k {
+                let j = (i..=k)
+                    .find(|&j| allowed(i, j) && item(i, j) && (j == k || ways[j + 1] == 1))
+                    .expect("one reading exists");
+                if j < k {
+                    chosen.push(commas[j]);
+                }
+                i = j + 1;
+            }
+            Some(Lists::One(chosen))
+        }
+        _ => None,
+    }
+}
+
+/// Read `word`, found at byte `offset` of `text`, as one figure: `None` when the grammar
+/// does not make it a figure, an error when it does but a float cannot hold it.
+fn figure(text: &str, offset: usize, word: &str) -> Option<FigureRead> {
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let (negative, mut rest) = match word.strip_prefix(['-', '\u{2212}']) {
+        Some(rest) => (true, rest),
+        None => (false, word),
     };
 
-    let mut figures = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if !at(i).is_some_and(|c| c.is_ascii_digit()) {
-            i += 1;
-            continue;
+    let mut number = String::new();
+    let whole = digits(rest);
+    number.push_str(&rest[..whole]);
+    rest = &rest[whole..];
+    while whole > 0 && rest.starts_with(',') && digits(&rest[1..]) == 3 {
+        number.push_str(&rest[1..4]);
+        rest = &rest[4..];
+    }
+    let mut decimal_places = 0;
+    if let Some(after) = rest.strip_prefix('.') {
+        decimal_places = digits(after);
+        if decimal_places > 0 {
+            number.push('.');
+            number.push_str(&after[..decimal_places]);
+            rest = &after[decimal_places..];
         }
-        let start = i;
-        i += digits_from(i);
-        while at(i) == Some(',') && digits_from(i + 1) == 3 {
-            i += 4;
-        }
-        let mut decimal_places = 0;
-        if at(i) == Some('.') && at(i + 1).is_some_and(|c| c.is_ascii_digit()) {
-            decimal_places = digits_from(i + 1);
-            i += 1 + decimal_places;
-        }
-        let number_end = i;
+    }
+    if whole == 0 && decimal_places == 0 {
+        return None;
+    }
 
-        // A further `.digit` makes this a dotted identifier such as 1.2.3: skip all of it.
-        if at(i) == Some('.') && at(i + 1).is_some_and(|c| c.is_ascii_digit()) {
-            while at(i).is_some_and(|c| c.is_ascii_digit() || c == '.') {
-                i += 1;
-            }
-            continue;
-        }
-
-        let previous = start.checked_sub(1).and_then(at);
-        let before_previous = start.checked_sub(2).and_then(at);
-        let mut negative = false;
-        let blocked_before = match previous {
-            Some(c) if is_word_character(c) => true,
-            Some('.') => before_previous.is_some_and(char::is_alphanumeric),
-            Some('-' | '\u{2212}') => match before_previous {
-                None => {
-                    negative = true;
-                    false
-                }
-                Some(c) if c.is_alphabetic() || c == '_' => true,
-                // A digit before the hyphen is a range ("10-20") unless that digit belongs
-                // to an identifier ("x86-64").
-                Some(c) if c.is_ascii_digit() => run_follows_letter(&chars, start - 2),
-                // After a percent sign or a multiplier the hyphen joins a range ("71.3%-73.9%").
-                Some('%' | '\u{00D7}') => false,
-                Some(c) => {
-                    negative = !c.is_alphanumeric();
-                    false
-                }
-            },
-            _ => false,
+    // `has_exponent` records that an exponent was written, so `3e0` is a measurement.
+    let mut exponent = 0_i32;
+    let mut has_exponent = false;
+    if let Some(after) = rest.strip_prefix(['e', 'E']) {
+        let (sign, unsigned) = match after.strip_prefix(['-', '\u{2212}']) {
+            Some(unsigned) => (-1, unsigned),
+            None => (1, after.strip_prefix('+').unwrap_or(after)),
         };
-
-        let mut end = i;
-        let mut percent = false;
-        let mut blocked_after = false;
-        match at(end) {
-            Some('%') => {
-                percent = true;
-                end += 1;
-                blocked_after = at(end).is_some_and(is_word_character);
-            }
-            Some('\u{00D7}') => {
-                end += 1;
-                blocked_after = at(end).is_some_and(is_word_character);
-            }
-            Some(c) if c.is_ascii_alphabetic() => {
-                let mut k = end;
-                while at(k).is_some_and(|c| c.is_ascii_alphabetic()) {
-                    k += 1;
-                }
-                let suffix = text[byte(end)..byte(k)].to_ascii_lowercase();
-                blocked_after = k - end > 3
-                    || at(k).is_some_and(|c| is_word_character(c) || c == '-')
-                    || matches!(suffix.as_str(), "st" | "nd" | "rd" | "th");
-                end = k;
-            }
-            Some('-') => blocked_after = at(end + 1).is_some_and(char::is_alphabetic),
-            Some(c) => blocked_after = is_word_character(c),
-            None => {}
+        let n = digits(unsigned);
+        if (1..=3).contains(&n) {
+            exponent = sign * unsigned[..n].parse::<i32>().ok()?;
+            has_exponent = true;
+            rest = &unsigned[n..];
         }
-        if blocked_before || blocked_after {
-            i = end.max(i);
-            continue;
-        }
-        if end == number_end && !percent {
-            percent = followed_by_points(&text[byte(end)..]);
-        }
-
-        let digits = text[byte(start)..byte(number_end)].replace(',', "");
-        let magnitude = digits
-            .parse::<f64>()
-            .expect("numeric token has valid digits");
-        let raw = if negative { -magnitude } else { magnitude };
-        let raw_tolerance = 0.5 * 10.0_f64.powf(-(decimal_places as f64));
-        let scale = if percent { 100.0 } else { 1.0 };
-        let written_start = if negative { start - 1 } else { start };
-        figures.push(Figure {
-            as_written: text[byte(written_start)..byte(end)].to_string(),
-            value: raw / scale,
-            tolerance: raw_tolerance / scale,
-            raw,
-            raw_tolerance,
-            percent,
-        });
-        i = end;
     }
-    figures
-}
 
-/// Whether the run of digits and dots ending at `index` starts right after a letter.
-fn run_follows_letter(chars: &[(usize, char)], index: usize) -> bool {
-    let mut k = index;
-    while k > 0 && (chars[k - 1].1.is_ascii_digit() || chars[k - 1].1 == '.') {
-        k -= 1;
+    let percent_sign = rest == "%";
+    let suffix_ok = rest.is_empty()
+        || percent_sign
+        || rest == "\u{00D7}"
+        || ((1..=3).contains(&rest.len())
+            && rest.bytes().all(|b| b.is_ascii_alphabetic())
+            && !matches!(
+                rest.to_ascii_lowercase().as_str(),
+                "st" | "nd" | "rd" | "th"
+            ));
+    if !suffix_ok {
+        return None;
     }
-    k > 0 && (chars[k - 1].1.is_alphabetic() || chars[k - 1].1 == '_')
+    let end = offset + word.len();
+    let percent = percent_sign || (rest.is_empty() && followed_by_points(&text[end..]));
+
+    let magnitude = if exponent == 0 {
+        format!("0{number}").parse::<f64>().ok()?
+    } else {
+        format!("0{number}e{exponent}").parse::<f64>().ok()?
+    };
+    let raw = if negative { -magnitude } else { magnitude };
+    let raw_tolerance = 0.5 * 10.0_f64.powf(f64::from(exponent) - decimal_places as f64);
+    let scale = if percent { 100.0 } else { 1.0 };
+    let (value, tolerance) = (raw / scale, raw_tolerance / scale);
+    if !(raw.is_finite() && value.is_finite() && raw_tolerance.is_normal() && tolerance.is_normal())
+    {
+        return Some(Err(FigureError {
+            as_written: word.to_string(),
+            offset,
+            problem: Problem::Unrepresentable,
+        }));
+    }
+    Some(Ok(Figure {
+        as_written: word.to_string(),
+        value,
+        tolerance,
+        raw,
+        raw_tolerance,
+        percent,
+        measured: percent || decimal_places > 0 || has_exponent,
+    }))
 }
 
 /// Whether the text after a number starts with whitespace and the word "points", "point"
@@ -167,16 +382,12 @@ fn followed_by_points(rest: &str) -> bool {
     matches!(word.as_str(), "points" | "point" | "pp")
 }
 
-fn is_word_character(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn check(text: &str, expected: &[(&str, f64, f64, f64, f64, bool)]) {
-        let figures = extract_figures(text);
+        let figures = extract_figures(text).unwrap();
         assert_eq!(figures.len(), expected.len(), "{text:?}: {figures:?}");
         for (figure, &(written, value, tolerance, raw, raw_tolerance, percent)) in
             figures.iter().zip(expected)
@@ -249,6 +460,18 @@ mod tests {
                 ("23", 23.0, 0.5, 23.0, 0.5, false),
                 ("1", 1.0, 0.5, 1.0, 0.5, false),
                 ("2345", 2345.0, 0.5, 2345.0, 0.5, false),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_list_split_keeps_thousands_groups_whole() {
+        // A comma the number rule reads as a thousands separator is not a list comma.
+        check(
+            "1,024.5,2.5",
+            &[
+                ("1,024.5", 1024.5, 0.05, 1024.5, 0.05, false),
+                ("2.5", 2.5, 0.05, 2.5, 0.05, false),
             ],
         );
     }
@@ -349,6 +572,215 @@ mod tests {
                 ("0.652", 0.652, 0.0005, 0.652, 0.0005, false),
             ],
         );
+    }
+
+    /// One row per grammar rule: the text and the figures it yields, as written.
+    #[test]
+    fn each_word_is_read_by_the_grammar() {
+        for (text, expected) in [
+            ("71.3%", &["71.3%"][..]),
+            ("(-2).", &["-2"]),
+            ("+3.1%", &["3.1%"]),
+            ("p<0.05, n=12", &["0.05", "12"]),
+            ("1,024,", &["1,024"]),
+            (".5 and -.5", &[".5", "-.5"]),
+            ("1e-3 1.5E2 2e", &["1e-3", "1.5E2", "2e"]),
+            ("1e1234", &[]),
+            ("10-20 1.0e-3-2e-3", &["10", "20", "1.0e-3", "2e-3"]),
+            ("1,23", &["1", "23"]),
+            ("1,024.5,2.5", &["1,024.5", "2.5"]),
+            ("1.5-2,000.5,3.5", &["1.5", "2,000.5", "3.5"]),
+            ("1.5,250,3 -1,000,2%", &["1.5", "250", "3", "-1,000", "2%"]),
+            ("1,000abcd,5", &["1", "5"]),
+            (
+                "12.5ms 4.2GB 3x 2.50\u{00D7}",
+                &["12.5ms", "4.2GB", "3x", "2.50\u{00D7}"],
+            ),
+            ("3rd 3xfaster 65%of 12_ r2", &[]),
+            ("v1.2.3 1.2.3 UTF-8 x86-64 Llama-3.1-8B 3-fold", &[]),
+        ] {
+            let written: Vec<String> = extract_figures(text)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.as_written)
+                .collect();
+            assert_eq!(written, expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn leading_dot_decimals_are_measurements() {
+        check(
+            "The score is .713 and the shift -.5.",
+            &[
+                (".713", 0.713, 0.0005, 0.713, 0.0005, false),
+                ("-.5", -0.5, 0.05, -0.5, 0.05, false),
+            ],
+        );
+        assert!(extract_figures(".713").unwrap()[0].measured);
+    }
+
+    #[test]
+    fn scientific_notation_scales_value_and_precision() {
+        check(
+            "The loss is 1.0e-3 and the rate 2.5E+4, timed at 1.0ms.",
+            &[
+                ("1.0e-3", 0.001, 0.00005, 0.001, 0.00005, false),
+                ("2.5E+4", 25000.0, 500.0, 25000.0, 500.0, false),
+                ("1.0ms", 1.0, 0.05, 1.0, 0.05, false),
+            ],
+        );
+        assert!(extract_figures("1e-3").unwrap()[0].measured);
+        assert!(!extract_figures("12").unwrap()[0].measured);
+    }
+
+    #[test]
+    fn a_written_exponent_is_a_measurement_even_when_zero() {
+        // The grammar makes a figure with an exponent a measurement; `e0` is written.
+        check("3e0", &[("3e0", 3.0, 0.5, 3.0, 0.5, false)]);
+        assert!(extract_figures("3e0").unwrap()[0].measured);
+        assert!(extract_figures("3E+0").unwrap()[0].measured);
+        // No exponent: a bare integer, and `2e`, whose `e` is a unit suffix.
+        assert!(!extract_figures("3").unwrap()[0].measured);
+        assert!(!extract_figures("2e").unwrap()[0].measured);
+    }
+
+    #[test]
+    fn numbers_inside_hyphenated_identifiers_are_not_figures() {
+        check(
+            "We describe Llama-3.1-8B, GPT-4o, COVID-19 and ResNet-50-v2.",
+            &[],
+        );
+        check(
+            "Ranges 10-20, 5\u{2013}10% and 0.1-0.2 stay ranges.",
+            &[
+                ("10", 10.0, 0.5, 10.0, 0.5, false),
+                ("20", 20.0, 0.5, 20.0, 0.5, false),
+                ("5", 5.0, 0.5, 5.0, 0.5, false),
+                ("10%", 0.1, 0.005, 10.0, 0.5, true),
+                ("0.1", 0.1, 0.05, 0.1, 0.05, false),
+                ("0.2", 0.2, 0.05, 0.2, 0.05, false),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_number_a_float_cannot_hold_is_an_error_not_a_value() {
+        // Read as a float, 1e-999 and its precision would both become 0 and match a
+        // metric of 0, and 1e999 would become infinite, so these are refused.
+        let long_integer = format!("1{}", "0".repeat(400));
+        let long_decimal = format!("0.{}1", "0".repeat(400));
+        for text in [
+            "1e-999",
+            "1e999",
+            "-1e999",
+            "0.0e-999",
+            "1e-310",
+            "1e-307%",
+            "1e-999-2e-3",
+            "loss 1e-999, then 2.5",
+            "v1e-999 then 1e-999",
+            &long_integer,
+            &long_decimal,
+        ] {
+            let error = extract_figures(text).unwrap_err();
+            assert!(
+                text[error.offset..].starts_with(&error.as_written),
+                "{text:?}: {error:?}"
+            );
+        }
+        // Representable exponents stay figures.
+        for text in ["1e-300", "1e300", "1e-3", "2.5E+4", "1e-300%"] {
+            assert_eq!(extract_figures(text).unwrap().len(), 1, "{text:?}");
+        }
+    }
+
+    /// Ranges, lists written without spaces and thousands groups together. Each row is
+    /// decided by the grammar: the one reading in which every item reads, or refused when
+    /// more than one does, or no figure when none does.
+    #[test]
+    fn ranges_lists_and_thousands_groups_read_one_way_or_are_refused() {
+        for (text, expected) in [
+            // A range is tried before a list, and its endpoints are whole figures.
+            ("1,000-2,000", Some(&["1,000", "2,000"][..])),
+            ("0.5-1,024", Some(&["0.5", "1,024"])),
+            ("0.5-1,500", Some(&["0.5", "1,500"])),
+            ("1-2,500", Some(&["1", "2,500"])),
+            ("2,000-3", Some(&["2,000", "3"])),
+            (
+                "\u{2212}1,500\u{2013}2,500",
+                Some(&["\u{2212}1,500", "2,500"]),
+            ),
+            // Lists with one reading: an item cannot start with 0 and another digit, a
+            // thousands group cannot follow a fraction, and a group is exactly 3 digits.
+            ("1,000-2,000,3,000", Some(&["1,000", "2,000", "3,000"])),
+            ("1.5-2,000.5,3.5", Some(&["1.5", "2,000.5", "3.5"])),
+            ("1,024.5,2.5", Some(&["1,024.5", "2.5"])),
+            ("1-2,3", Some(&["1", "2", "3"])),
+            ("10,000,20,000", Some(&["10,000", "20,000"])),
+            ("-1,000,-2,000", Some(&["-1,000", "-2,000"])),
+            ("1,000,000,5", Some(&["1,000,000", "5"])),
+            ("2.5%,1,000", Some(&["2.5%", "1,000"])),
+            ("1.5,250", Some(&["1.5", "250"])),
+            ("1,000,5.5", Some(&["1,000", "5.5"])),
+            ("1,000%,2", Some(&["1,000%", "2"])),
+            ("1,2,3", Some(&["1", "2", "3"])),
+            ("x86-64,2", Some(&["2"])),
+            // No reading: an identifier, so no figure.
+            ("1,05", Some(&[])),
+            ("1e3,000", Some(&[])),
+            ("1,000.5,000", Some(&[])),
+            // More than one reading: refused.
+            ("1,234,5", None),
+            ("1,500,000,5", None),
+            ("1-2,500,3", None),
+            ("1.5-2,500.5,3.5", None),
+            ("1,000-2,500,3", None),
+            ("1,500,2", None),
+            ("12,345.6,7", None),
+        ] {
+            let result = extract_figures(text);
+            match expected {
+                Some(expected) => {
+                    let written: Vec<String> = result
+                        .unwrap_or_else(|e| panic!("{text:?}: {e:?}"))
+                        .into_iter()
+                        .map(|f| f.as_written)
+                        .collect();
+                    assert_eq!(written, expected, "{text:?}");
+                }
+                None => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.problem, Problem::Ambiguous, "{text:?}");
+                    assert_eq!((error.offset, error.as_written.as_str()), (0, text));
+                }
+            }
+        }
+        // Lists of any length whose commas cannot be thousands separators are read
+        // directly; a run of more than 64 possible thousands separators is refused.
+        let long: Vec<String> = (0..500).map(|n| (n % 99 + 1).to_string()).collect();
+        assert_eq!(extract_figures(&long.join(",")).unwrap().len(), 500);
+        let groups = format!("1{},12", ",500".repeat(65));
+        assert_eq!(
+            extract_figures(&groups).unwrap_err().problem,
+            Problem::Ambiguous
+        );
+        // The refused word is reported where it stands.
+        let error = extract_figures("seeds 2 and 1,234,5 runs").unwrap_err();
+        assert_eq!((error.offset, error.as_written.as_str()), (12, "1,234,5"));
+    }
+
+    /// Reading a list is linear in its commas outside runs of possible thousands
+    /// separators: 100,000 items took about 90 s when each stretch scanned every comma.
+    /// Within a stretch at most `MAX_LIST_COMMAS` candidates are weighed, so the work there
+    /// is bounded by a constant times the stretch length.
+    #[test]
+    fn a_long_list_without_spaces_reads_in_linear_time() {
+        let word = vec!["1"; 100_000].join(",");
+        let started = std::time::Instant::now();
+        assert_eq!(extract_figures(&word).unwrap().len(), 100_000);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
     }
 
     #[test]

@@ -383,8 +383,17 @@ fn ingest_refuses_an_existing_store_unless_replace_is_given() {
     let (_dir, path) = built(&CLEAN);
     let err = ingest(&CLEAN, &path, false).unwrap_err();
     assert!(matches!(err, StoreError::Exists(_)), "got {err}");
-    ingest(&CLEAN, &path, true).unwrap();
-    assert_eq!(count(&path, "MATCH (c:Claim) RETURN count(c)"), 7);
+    // Replace with a different graph, so a replacement that kept the old store would fail.
+    ingest(&MESSY, &path, true).unwrap();
+    let (_messy_dir, messy) = built(&MESSY);
+    assert_eq!(
+        answers::dump(&path).unwrap(),
+        answers::dump(&messy).unwrap()
+    );
+    assert_ne!(
+        answers::dump(&path).unwrap(),
+        answers::dump(&built(&CLEAN).1).unwrap()
+    );
 }
 
 #[test]
@@ -621,7 +630,7 @@ fn derivations_carry_their_operands_in_the_dump() {
 #[test]
 fn replace_leaves_no_temporary_files() {
     let (dir, path) = built(&CLEAN);
-    ingest(&CLEAN, &path, true).unwrap();
+    ingest(&MESSY, &path, true).unwrap();
     let names: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -649,4 +658,46 @@ fn the_roundoff_allowance_stays_below_the_written_precision() {
     );
     let (_dir, path) = built_from("The gap is 1000000000000.0 steps [exp:E1].\n", &runs);
     assert_eq!(mismatched(&path), [pair("C1", "1000000000000.0")]);
+
+    // Direct match with large operands: 1000000000000000.0 is written to 0.05, and the
+    // operand-relative allowance alone (about 2.0 here) would accept 1000000000000001.0,
+    // so only the cap at a millionth of the written tolerance rejects it.
+    let runs = format!(
+        "{E1_RUNS}{}",
+        r#"{"kind":"metric","run":"r-1","name":"count","value":1000000000000001.0}
+"#
+    );
+    let (_dir, path) = built_from("We reached 1000000000000000.0 steps [run:r-1].\n", &runs);
+    assert_eq!(mismatched(&path), [pair("C1", "1000000000000000.0")]);
+
+    // Large operands: the difference is exactly 2.0, and 1.0 is written to 0.05, so the
+    // allowance may not grow with the operands past the written precision.
+    for (minuend, figure, expected) in [
+        ("1000000000000002.0", "1.0", &[pair("C1", "1.0")][..]),
+        ("1000000000000001.0", "1.0", &[]),
+    ] {
+        let runs = format!(
+            "{E1_RUNS}{{\"kind\":\"metric\",\"run\":\"r-1\",\"name\":\"count\",\"value\":{minuend}}}\n\
+             {{\"kind\":\"metric\",\"run\":\"r-2\",\"name\":\"count\",\"value\":1000000000000000.0}}\n"
+        );
+        let (_dir, path) = built_from(&format!("The gap is {figure} steps [exp:E1].\n"), &runs);
+        assert_eq!(mismatched(&path), expected, "{minuend}");
+    }
+}
+
+/// `audit` reads every finding through one opened store. That is safe only if an opened
+/// store keeps reading one version of the graph while a replacement is published by
+/// rename, and a second open would see the new version; this pins both.
+#[test]
+fn one_opened_store_reads_one_version_across_a_replacement() {
+    let claims = "MATCH (c:Claim) RETURN count(c)";
+    let (_dir, path) = built(&CLEAN);
+    let clean_claims = count(&path, claims);
+    let db = Database::open_read_only(path.to_str().unwrap()).unwrap();
+    let mut conn = db.connect().unwrap();
+    ingest(&MESSY, &path, true).unwrap();
+    let messy_claims = count(&path, claims);
+    assert_ne!(clean_claims, messy_claims);
+    let same_handle = conn.query(claims).unwrap().rows[0][0].as_int().unwrap();
+    assert_eq!(same_handle, clean_claims);
 }

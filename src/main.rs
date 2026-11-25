@@ -39,7 +39,8 @@ enum Command {
         /// JSON Lines run log (see SPEC.md for the format).
         #[arg(long)]
         runs: PathBuf,
-        /// Relate store to create; must end in .rl.
+        /// Relate store to create; must end in .rl. Without --replace it is published with a
+        /// hard link, so its directory must be on a file system that supports hard links.
         #[arg(long)]
         store: PathBuf,
         /// Delete an existing store file at --store and rebuild it.
@@ -134,7 +135,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(code) => code,
         Err(message) => {
-            eprintln!("error: {message}");
+            write_stderr(&format!("error: {message}\n"));
             ExitCode::FAILURE
         }
     }
@@ -226,6 +227,12 @@ fn emit<T: Serialize>(
 }
 
 /// Write to stdout; a reader that stops early (such as `head`) is not an error.
+/// Write a diagnostic; a closed stderr must not turn a finished command into a panic.
+fn write_stderr(output: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(output.as_bytes());
+}
+
 fn write_stdout(output: &str) -> Result<(), String> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
@@ -259,11 +266,15 @@ fn ingest(
     )
     .map_err(|e| e.to_string())?;
     for (claim, reference) in &s.unresolved {
-        eprintln!("warning: {claim} references {reference}, which is not defined");
+        write_stderr(&format!(
+            "warning: {claim} references {reference}, which is not defined\n"
+        ));
     }
-    println!(
+    // The store is already published; a reader that has gone must not turn that into a
+    // failure, so the summary follows the same broken-pipe rule as every other output.
+    write_stdout(&format!(
         "wrote {}: {} claims, {} prose sentences, {} sources, {} experiments, {} runs, {} metrics, \
-         {} figures, {} figure-metric matches, {} differences",
+         {} figures, {} figure-metric matches, {} differences\n",
         store_path.display(),
         s.claims,
         s.prose,
@@ -274,8 +285,7 @@ fn ingest(
         s.figures,
         s.matches,
         s.derivations
-    );
-    Ok(())
+    ))
 }
 
 fn section(name: &str) -> &str {

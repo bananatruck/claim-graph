@@ -120,29 +120,76 @@ pub fn ingest(
         draft_path,
         draft,
         log,
+        replace,
     )
 }
 
 /// Build the store at `temporary`, then move it to `path`.
+///
+/// Without `replace`, the store is published with a hard link, which fails atomically if
+/// `path` exists by then, so a store another ingest published meanwhile is never replaced;
+/// checking `path.exists()` again first would leave the race open. With `replace`, a rename
+/// swaps the new store in. The temporary file sits beside `path`, on the same file system.
 fn publish(
     path: &Path,
     temporary: &Path,
     draft_path: &str,
     draft: &Draft,
     log: &RunLog,
+    replace: bool,
 ) -> Result<IngestSummary, StoreError> {
     if temporary.exists() {
         // Someone else's file: report it and leave it alone.
         return Err(StoreError::Exists(temporary.to_path_buf()));
     }
     let result = build(temporary, draft_path, draft, log).and_then(|summary| {
-        std::fs::rename(temporary, path)?;
+        if replace {
+            std::fs::rename(temporary, path)?;
+        } else {
+            link_into_place(temporary, path)?;
+        }
         Ok(summary)
     });
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
     result
+}
+
+/// Publish the complete store at `temporary` as `path` with a hard link, which fails
+/// atomically if `path` exists. Once the link exists the store is published, so only the
+/// link decides the result: the temporary name is a second name for the same file, and
+/// if removing it fails here, dropping the workspace directory removes it where it can.
+fn link_into_place(temporary: &Path, path: &Path) -> Result<(), StoreError> {
+    link_then_remove(temporary, path, |p| std::fs::remove_file(p))
+}
+
+/// `link_into_place` with the removal of the temporary name passed in, so a test can make
+/// it fail without depending on file permissions or the privileges of the process.
+fn link_then_remove(
+    temporary: &Path,
+    path: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), StoreError> {
+    match std::fs::hard_link(temporary, path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(StoreError::Exists(path.to_path_buf()));
+        }
+        Err(e) => {
+            // FAT and exFAT, for example, have no hard links; --replace is not a
+            // substitute, because it overwrites.
+            return Err(StoreError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot publish {}: {e}; without --replace the store is published with a hard link, so it needs a file system that supports hard links",
+                    path.display()
+                ),
+            )));
+        }
+        Ok(()) => {}
+    }
+    let _ = remove(temporary);
+    Ok(())
 }
 
 fn build(
@@ -306,9 +353,8 @@ fn rows(draft_path: &str, draft: &Draft, log: &RunLog) -> Json {
             experiment_links.push(json!({"claim": sentence.id, "id": id}));
         }
         for (index, figure) in sentence.figures.iter().enumerate() {
-            // Only percentages and numbers written with decimals are treated as
+            // Percentages and numbers written with a decimal point or an exponent are
             // measurements; bare integers are usually counts ("3 seeds", "2024").
-            let measured = figure.percent || figure.as_written.contains('.');
             figures.push(json!({
                 "claim": sentence.id,
                 "index": index,
@@ -318,7 +364,7 @@ fn rows(draft_path: &str, draft: &Draft, log: &RunLog) -> Json {
                 "raw": figure.raw,
                 "raw_tolerance": figure.raw_tolerance,
                 "percent": figure.percent,
-                "measured": measured,
+                "measured": figure.measured,
             }));
         }
     }
@@ -370,12 +416,77 @@ mod tests {
         std::fs::write(&temporary, b"another ingest's store").unwrap();
         let draft = parse_draft(include_str!("../data/synthetic/draft.md")).unwrap();
         let log = parse_run_log(include_str!("../data/synthetic/runs.jsonl")).unwrap();
-        let result = publish(&path, &temporary, "draft.md", &draft, &log);
+        let result = publish(&path, &temporary, "draft.md", &draft, &log, false);
         assert!(matches!(result, Err(StoreError::Exists(_))));
         assert_eq!(
             std::fs::read(&temporary).unwrap(),
             b"another ingest's store"
         );
         assert!(!path.exists());
+    }
+
+    /// Once the hard link exists the store is published; failing to remove the temporary
+    /// name afterwards must not report the ingest as failed, or a retry without `replace`
+    /// would refuse the store this ingest just published.
+    #[test]
+    fn publication_succeeds_once_linked_even_if_the_temporary_name_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let temporary = dir.path().join("store.rl");
+        std::fs::write(&temporary, b"complete store").unwrap();
+        let path = dir.path().join("claims.rl");
+        let mut attempted = false;
+        let result = link_then_remove(&temporary, &path, |p: &Path| {
+            attempted = p == temporary;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert!(attempted);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete store");
+    }
+
+    #[test]
+    fn a_failed_hard_link_says_publication_needs_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = link_into_place(
+            &dir.path().join("missing.rl"),
+            &dir.path().join("claims.rl"),
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("needs a file system that supports hard links"),
+            "{message}"
+        );
+        assert!(!dir.path().join("claims.rl").exists());
+    }
+
+    /// Two ingests without `replace` can both pass the first existence check; the one
+    /// that publishes second must fail instead of replacing the first one's store.
+    #[test]
+    fn publishing_without_replace_never_overwrites_a_store_published_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.rl");
+        let draft = parse_draft(include_str!("../data/synthetic/draft.md")).unwrap();
+        let log = parse_run_log(include_str!("../data/synthetic/runs.jsonl")).unwrap();
+        std::fs::write(&path, b"the store another ingest published").unwrap();
+
+        let workspace = tempfile::tempdir_in(dir.path()).unwrap();
+        let temporary = workspace.path().join("store.rl");
+        let result = publish(&path, &temporary, "draft.md", &draft, &log, false);
+        assert!(
+            matches!(&result, Err(StoreError::Exists(p)) if p == &path),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the store another ingest published"
+        );
+        assert!(!temporary.exists());
+
+        let replaced = publish(&path, &temporary, "draft.md", &draft, &log, true);
+        assert!(replaced.is_ok(), "{replaced:?}");
+        assert_ne!(
+            std::fs::read(&path).unwrap(),
+            b"the store another ingest published"
+        );
     }
 }
