@@ -257,6 +257,13 @@ impl Parser {
                 line: paragraph.line_at(start + offset),
                 message,
             })?;
+            let figures = extract_figures(&refs.plain).map_err(|e| ParseError {
+                line: paragraph.line_at(start + sentence.find(&e.as_written).unwrap_or(0)),
+                message: format!(
+                    "the number `{}` cannot be held with its written precision by a 64-bit float, so it cannot be checked",
+                    e.as_written
+                ),
+            })?;
             let reasons = classify(
                 &refs.plain,
                 !refs.citations.is_empty(),
@@ -277,7 +284,7 @@ impl Parser {
                 citations: refs.citations,
                 runs: refs.runs,
                 experiments: refs.experiments,
-                figures: extract_figures(&refs.plain),
+                figures,
                 reasons,
             });
         }
@@ -588,6 +595,15 @@ mod tests {
                 "Last claim has 2 parts."
             ]
         );
+    }
+
+    #[test]
+    fn a_number_a_float_cannot_hold_is_a_parse_error_at_its_line() {
+        let error =
+            parse_draft("## Results\n\nThe run is stable.\nWe reached 1e-999 loss [run:r-1].\n")
+                .unwrap_err();
+        assert_eq!(error.line, 4, "{error}");
+        assert!(error.message.contains("`1e-999`"), "{error}");
     }
 
     #[test]

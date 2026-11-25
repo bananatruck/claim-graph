@@ -22,6 +22,12 @@
 //! suffix   = "%" | "×" | 1 to 3 ASCII letters other than st, nd, rd, th
 //! ```
 //!
+//! A figure whose value or written precision a 64-bit float cannot hold, such as `1e-999`
+//! (both would become 0 and match a metric of 0) or `1e999` (infinite), is an error, so
+//! the draft is refused rather than the number read as a value it does not have. The
+//! value and the precision must be finite, and the precision a normal float, at least
+//! about 2.2e-308, on both the written and the percent scale.
+//!
 //! A figure is a measurement when it is a percentage or has a decimal point or a written
 //! exponent, `e0` included; a bare integer is usually a count ("3 seeds", "2024").
 
@@ -45,6 +51,13 @@ pub struct Figure {
     pub measured: bool,
 }
 
+/// A figure whose value or written precision a 64-bit float cannot hold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unrepresentable {
+    /// The figure as written.
+    pub as_written: String,
+}
+
 const DASHES: [char; 3] = ['-', '\u{2212}', '\u{2013}'];
 
 fn is_word_part(c: char) -> bool {
@@ -53,8 +66,9 @@ fn is_word_part(c: char) -> bool {
         || DASHES.contains(&c)
 }
 
-/// Extract the figures of `text` in order, by the grammar in the module documentation.
-pub fn extract_figures(text: &str) -> Vec<Figure> {
+/// Extract the figures of `text` in order, by the grammar in the module documentation,
+/// or the first figure a 64-bit float cannot hold.
+pub fn extract_figures(text: &str) -> Result<Vec<Figure>, Unrepresentable> {
     let mut figures = Vec::new();
     let mut rest = text;
     while let Some(begin) = rest.find(is_word_part) {
@@ -72,11 +86,13 @@ pub fn extract_figures(text: &str) -> Vec<Figure> {
         );
         rest = &tail[length..];
     }
-    figures
+    figures.into_iter().collect()
 }
 
+type FigureRead = Result<Figure, Unrepresentable>;
+
 /// Read one word that starts at byte `offset` of `text`.
-fn read_word(text: &str, offset: usize, word: &str, figures: &mut Vec<Figure>) {
+fn read_word(text: &str, offset: usize, word: &str, figures: &mut Vec<FigureRead>) {
     if word.is_empty() {
         return;
     }
@@ -124,8 +140,9 @@ fn list_commas(word: &str) -> Vec<usize> {
     splits
 }
 
-/// Read `word`, found at byte `offset` of `text`, as one figure.
-fn figure(text: &str, offset: usize, word: &str) -> Option<Figure> {
+/// Read `word`, found at byte `offset` of `text`, as one figure: `None` when the grammar
+/// does not make it a figure, an error when it does but a float cannot hold it.
+fn figure(text: &str, offset: usize, word: &str) -> Option<FigureRead> {
     let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
     let (negative, mut rest) = match word.strip_prefix(['-', '\u{2212}']) {
         Some(rest) => (true, rest),
@@ -193,15 +210,22 @@ fn figure(text: &str, offset: usize, word: &str) -> Option<Figure> {
     let raw = if negative { -magnitude } else { magnitude };
     let raw_tolerance = 0.5 * 10.0_f64.powf(f64::from(exponent) - decimal_places as f64);
     let scale = if percent { 100.0 } else { 1.0 };
-    Some(Figure {
+    let (value, tolerance) = (raw / scale, raw_tolerance / scale);
+    if !(raw.is_finite() && value.is_finite() && raw_tolerance.is_normal() && tolerance.is_normal())
+    {
+        return Some(Err(Unrepresentable {
+            as_written: word.to_string(),
+        }));
+    }
+    Some(Ok(Figure {
         as_written: word.to_string(),
-        value: raw / scale,
-        tolerance: raw_tolerance / scale,
+        value,
+        tolerance,
         raw,
         raw_tolerance,
         percent,
         measured: percent || decimal_places > 0 || has_exponent,
-    })
+    }))
 }
 
 /// Whether the text after a number starts with whitespace and the word "points", "point"
@@ -224,7 +248,7 @@ mod tests {
     use super::*;
 
     fn check(text: &str, expected: &[(&str, f64, f64, f64, f64, bool)]) {
-        let figures = extract_figures(text);
+        let figures = extract_figures(text).unwrap();
         assert_eq!(figures.len(), expected.len(), "{text:?}: {figures:?}");
         for (figure, &(written, value, tolerance, raw, raw_tolerance, percent)) in
             figures.iter().zip(expected)
@@ -436,6 +460,7 @@ mod tests {
             ("v1.2.3 1.2.3 UTF-8 x86-64 Llama-3.1-8B 3-fold", &[]),
         ] {
             let written: Vec<String> = extract_figures(text)
+                .unwrap()
                 .into_iter()
                 .map(|f| f.as_written)
                 .collect();
@@ -452,7 +477,7 @@ mod tests {
                 ("-.5", -0.5, 0.05, -0.5, 0.05, false),
             ],
         );
-        assert!(extract_figures(".713")[0].measured);
+        assert!(extract_figures(".713").unwrap()[0].measured);
     }
 
     #[test]
@@ -465,19 +490,19 @@ mod tests {
                 ("1.0ms", 1.0, 0.05, 1.0, 0.05, false),
             ],
         );
-        assert!(extract_figures("1e-3")[0].measured);
-        assert!(!extract_figures("12")[0].measured);
+        assert!(extract_figures("1e-3").unwrap()[0].measured);
+        assert!(!extract_figures("12").unwrap()[0].measured);
     }
 
     #[test]
     fn a_written_exponent_is_a_measurement_even_when_zero() {
         // The grammar makes a figure with an exponent a measurement; `e0` is written.
         check("3e0", &[("3e0", 3.0, 0.5, 3.0, 0.5, false)]);
-        assert!(extract_figures("3e0")[0].measured);
-        assert!(extract_figures("3E+0")[0].measured);
+        assert!(extract_figures("3e0").unwrap()[0].measured);
+        assert!(extract_figures("3E+0").unwrap()[0].measured);
         // No exponent: a bare integer, and `2e`, whose `e` is a unit suffix.
-        assert!(!extract_figures("3")[0].measured);
-        assert!(!extract_figures("2e")[0].measured);
+        assert!(!extract_figures("3").unwrap()[0].measured);
+        assert!(!extract_figures("2e").unwrap()[0].measured);
     }
 
     #[test]
@@ -497,6 +522,33 @@ mod tests {
                 ("0.2", 0.2, 0.05, 0.2, 0.05, false),
             ],
         );
+    }
+
+    #[test]
+    fn a_number_a_float_cannot_hold_is_an_error_not_a_value() {
+        // Read as a float, 1e-999 and its precision would both become 0 and match a
+        // metric of 0, and 1e999 would become infinite, so these are refused.
+        let long_integer = format!("1{}", "0".repeat(400));
+        let long_decimal = format!("0.{}1", "0".repeat(400));
+        for text in [
+            "1e-999",
+            "1e999",
+            "-1e999",
+            "0.0e-999",
+            "1e-310",
+            "1e-307%",
+            "1e-999-2e-3",
+            "loss 1e-999, then 2.5",
+            &long_integer,
+            &long_decimal,
+        ] {
+            let error = extract_figures(text).unwrap_err();
+            assert!(text.contains(&error.as_written), "{text:?}: {error:?}");
+        }
+        // Representable exponents stay figures.
+        for text in ["1e-300", "1e300", "1e-3", "2.5E+4", "1e-300%"] {
+            assert_eq!(extract_figures(text).unwrap().len(), 1, "{text:?}");
+        }
     }
 
     #[test]

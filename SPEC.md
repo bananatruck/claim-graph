@@ -40,6 +40,7 @@ There are two datasets: `data/synthetic/` (small and tidy) and `data/synthetic/m
 - A line of three or more backticks opens a code fence, closed by a line of at least as many backticks and nothing else; a line that also closes its backticks is inline code, not a fence.
 - A line starting with `$$` opens a math block, closed by a line that starts or ends with `$$`; `$$ ... $$` on one line is removed and the rest of the line kept.
 - A fence or math block still open at the end of the draft is a parse error naming the line that opened it.
+- A number whose value or written precision a 64-bit float cannot hold (`1e-999`, `1e999`) is a parse error naming its line, because as a float it would become 0 or infinity and could match a metric it does not equal.
 - A `# ` heading after the first one starts a new section and ends the References section.
 - A paragraph is a run of non-blank lines; each list item (`- `, `* `, `1. `, `1) `) is its own paragraph.
 - A sentence ends at `.`, `!` or `?`, plus any closing brackets or quotes right after it, followed by whitespace or the end of the paragraph, so `71.3` does not split a sentence and `.)` ends one.
@@ -69,6 +70,7 @@ A leading dot (`.713`) and an exponent (`1.0e-3`) are part of the number; the ex
 A unit suffix of up to three letters (`12.5ms`, `10k`, `3x`) is kept as written but does not rescale the number.
 `71.3%` and "71.3 points" (or `pp`) are on the percent scale: stored as 0.713, and as written, 71.3.
 Each figure carries the precision it was written with: half a unit in its last digit.
+Value and precision must be finite, and the precision at least the smallest normal 64-bit float (about 2.2e-308) on both scales; otherwise the draft is refused, as above.
 Only percentages and numbers written with a decimal point or an exponent (`3e0` included) count as measurements; bare integers are treated as counts ("3 seeds", "2024") and never matched to metrics.
 
 ### Run log (JSON Lines)
