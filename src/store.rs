@@ -161,6 +161,16 @@ fn publish(
 /// link decides the result: the temporary name is a second name for the same file, and
 /// if removing it fails here, dropping the workspace directory removes it where it can.
 fn link_into_place(temporary: &Path, path: &Path) -> Result<(), StoreError> {
+    link_then_remove(temporary, path, |p| std::fs::remove_file(p))
+}
+
+/// `link_into_place` with the removal of the temporary name passed in, so a test can make
+/// it fail without depending on file permissions or the privileges of the process.
+fn link_then_remove(
+    temporary: &Path,
+    path: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), StoreError> {
     match std::fs::hard_link(temporary, path) {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(StoreError::Exists(path.to_path_buf()));
@@ -178,7 +188,7 @@ fn link_into_place(temporary: &Path, path: &Path) -> Result<(), StoreError> {
         }
         Ok(()) => {}
     }
-    let _ = std::fs::remove_file(temporary);
+    let _ = remove(temporary);
     Ok(())
 }
 
@@ -418,25 +428,18 @@ mod tests {
     /// Once the hard link exists the store is published; failing to remove the temporary
     /// name afterwards must not report the ingest as failed, or a retry without `replace`
     /// would refuse the store this ingest just published.
-    #[cfg(unix)]
     #[test]
     fn publication_succeeds_once_linked_even_if_the_temporary_name_stays() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        let temporary = workspace.join("store.rl");
+        let temporary = dir.path().join("store.rl");
         std::fs::write(&temporary, b"complete store").unwrap();
         let path = dir.path().join("claims.rl");
-        // A read-only workspace makes removing the temporary name fail after linking.
-        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let probe = std::fs::remove_file(&temporary).is_err();
-        let result = link_into_place(&temporary, &path);
-        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            probe,
-            "the read-only workspace did not stop removal (running as root?)"
-        );
+        let mut attempted = false;
+        let result = link_then_remove(&temporary, &path, |p: &Path| {
+            attempted = p == temporary;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert!(attempted);
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"complete store");
     }
