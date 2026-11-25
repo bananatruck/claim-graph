@@ -5,7 +5,7 @@
 use std::fmt;
 
 use crate::classify::{Reason, classify};
-use crate::figures::{Figure, extract_figures};
+use crate::figures::{Figure, Problem, extract_figures};
 
 /// A parsed draft: its title, its sentences in reading order, and its bibliography.
 #[derive(Debug, Clone, PartialEq)]
@@ -259,10 +259,16 @@ impl Parser {
             })?;
             let figures = extract_figures(&refs.plain).map_err(|e| ParseError {
                 line: paragraph.line_at(start + refs.sentence_offset(e.offset)),
-                message: format!(
-                    "the number `{}` cannot be held with its written precision by a 64-bit float, so it cannot be checked",
-                    e.as_written
-                ),
+                message: match e.problem {
+                    Problem::Unrepresentable => format!(
+                        "the number `{}` cannot be held with its written precision by a 64-bit float, so it cannot be checked",
+                        e.as_written
+                    ),
+                    Problem::Ambiguous => format!(
+                        "`{}` cannot be read as one list of numbers; write a space after each list comma",
+                        e.as_written
+                    ),
+                },
             })?;
             let reasons = classify(
                 &refs.plain,
@@ -621,6 +627,13 @@ mod tests {
                 .unwrap_err();
         assert_eq!(error.line, 4, "{error}");
         assert!(error.message.contains("`1e-999`"), "{error}");
+    }
+
+    #[test]
+    fn an_ambiguous_list_of_numbers_is_a_parse_error_at_its_line() {
+        let error = parse_draft("Seeds 1,2 and\nscores 1,234,5 [run:r].\n").unwrap_err();
+        assert_eq!(error.line, 2, "{error}");
+        assert!(error.message.contains("`1,234,5`"), "{error}");
     }
 
     #[test]

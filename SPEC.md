@@ -41,6 +41,7 @@ There are two datasets: `data/synthetic/` (small and tidy) and `data/synthetic/m
 - A line starting with `$$` opens a math block, closed by a line that starts or ends with `$$`; `$$ ... $$` on one line is removed and the rest of the line kept.
 - A fence or math block still open at the end of the draft is a parse error naming the line that opened it.
 - A number whose value or written precision a 64-bit float cannot hold (`1e-999`, `1e999`) is a parse error naming its line, because as a float it would become 0 or infinity and could match a metric it does not equal.
+- A list of numbers written without spaces that reads more than one way (`1,234,5`) is a parse error naming its line (see Figures).
 - A `# ` heading after the first one starts a new section and ends the References section.
 - A paragraph is a run of non-blank lines; each list item (`- `, `* `, `1. `, `1) `) is its own paragraph.
 - A sentence ends at `.`, `!` or `?`, plus any closing brackets or quotes right after it, followed by whitespace or the end of the paragraph, so `71.3` does not split a sentence and `.)` ends one.
@@ -64,7 +65,10 @@ It errs towards checking: a sentence such as "Fig. 3 shows the error rate" count
 A figure is a number in a claim, outside reference markers.
 The text is read as whole words, and the grammar in `src/figures.rs` decides whether a word is a figure, a range of two figures, a comma list written without spaces, or an identifier holding none.
 So `r2`, `v1.2.3`, `1.2.3`, `gpt-3.5-turbo`, `UTF-8`, `x86-64`, `Llama-3.1-8B` and `3rd` are not figures.
-In a list written without spaces, a comma that the number rule reads as a thousands separator stays in its number, so `1,024.5,2.5` is 1,024.5 and 2.5, while `1,23` is 1 and 23.
+In a list written without spaces, each comma is a list comma or a thousands separator, and an item does not start with `0` and another digit.
+The one choice that makes every item read is the list: `1,23` is 1 and 23, `1,024.5,2.5` is 1,024.5 and 2.5, and `1.5-2,000.5,3.5` is 1.5, 2,000.5 and 3.5.
+A word that reads as one figure or a range is never a list, so `1,500` is 1,500 and `0.5-1,500` is 0.5 and 1,500.
+A list with more than one such choice, such as `1,234,5` (1,234 and 5, or 1, 234 and 5), is a parse error naming its line, so no reading is picked that might match a metric; a list with none is an identifier.
 A leading minus sign (`-0.25`, `−3.1%`) belongs to the figure; a dash between two figures (`10-20`, `71.3%-73.9%`) is a range.
 A leading dot (`.713`) and an exponent (`1.0e-3`) are part of the number; the exponent scales both the value and the written precision.
 A unit suffix of up to three letters (`12.5ms`, `10k`, `3x`) is kept as written but does not rescale the number.
