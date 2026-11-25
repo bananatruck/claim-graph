@@ -194,14 +194,19 @@ impl Parser {
             }
         }
         if let Some(heading) = trimmed.strip_prefix("# ") {
-            // A top-level heading also ends the References section.
             self.flush()?;
             let heading = heading.trim().to_string();
-            if self.title.is_none() {
+            let is_title = self.title.is_none();
+            if is_title {
                 self.title = Some(heading.clone());
             }
-            self.section = heading;
-            self.in_references = false;
+            // The title alone is not a section: sentences before the first section have an
+            // empty one. Any other top-level heading, or the title once a section has started,
+            // starts a section and ends the References section.
+            if !is_title || !self.section.is_empty() {
+                self.section = heading;
+                self.in_references = false;
+            }
         } else if let Some(heading) = trimmed.strip_prefix("## ") {
             self.flush()?;
             self.section = heading.trim().to_string();
@@ -744,6 +749,14 @@ mod tests {
     fn al_is_an_abbreviation_only_after_et() {
         let draft = parse_draft("The team named it al. Then 2 runs failed.\n").unwrap();
         assert_eq!(draft.sentences.len(), 2);
+    }
+
+    #[test]
+    fn the_title_is_not_a_section() {
+        let draft = parse_draft("# Paper\nAccuracy is 71.3%.\n\n## Results\nIt is 72.0%.\n\n# Appendix\nWe add 1 note.\n").unwrap();
+        assert_eq!(draft.title, "Paper");
+        let sections: Vec<&str> = draft.sentences.iter().map(|s| s.section.as_str()).collect();
+        assert_eq!(sections, ["", "Results", "Appendix"]);
     }
 
     #[test]

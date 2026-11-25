@@ -34,7 +34,7 @@ There are two datasets: `data/synthetic/` (small and tidy) and `data/synthetic/m
 
 ### Draft (Markdown)
 
-- The first `# ` heading is the draft title.
+- The first `# ` heading is the draft title; before any section it is only the title, so sentences before the first section have an empty section name.
 - A `## ` heading starts a section; the section name is stored on each sentence.
 - Lines starting with `>` (notes), `|` (table rows) and `![` (images), and deeper headings (three to six `#` followed by a space or the end of the line) are skipped; other text that starts with `#`, such as `#1 reached 74.2%` or a tab after the `#` run (`##\tResults`), is read as a sentence.
 - A line of three or more backticks opens a code fence, closed by a line of at least as many backticks and nothing else; a line that also closes its backticks is inline code, not a fence.
@@ -42,7 +42,7 @@ There are two datasets: `data/synthetic/` (small and tidy) and `data/synthetic/m
 - A fence or math block still open at the end of the draft is a parse error naming the line that opened it.
 - A number whose value or written precision a 64-bit float cannot hold (`1e-999`, `1e999`) is a parse error naming its line, because as a float it would become 0 or infinity and could match a metric it does not equal.
 - A list of numbers written without spaces that reads more than one way (`1,234,5`) is a parse error naming its line (see Figures).
-- A `# ` heading after the first one starts a new section and ends the References section.
+- Any other `# ` heading, or the title when a section has already started, starts a new section and ends the References section.
 - A paragraph is a run of non-blank lines; each list item (`- `, `* `, `1. `, `1) `) is its own paragraph.
 - A sentence ends at `.`, `!` or `?`, plus any closing brackets or quotes right after it, followed by whitespace or the end of the paragraph, so `71.3` does not split a sentence and `.)` ends one.
 - Punctuation inside a reference marker never ends a sentence.
