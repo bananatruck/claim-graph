@@ -245,6 +245,20 @@ fn write_stdout(output: &str) -> Result<(), String> {
     }
 }
 
+/// Whether two paths reach one file, following symbolic links: the same device and inode.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+/// Whether two paths reach one file: the same canonical path.
+#[cfg(not(unix))]
+fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
+    Ok(std::fs::canonicalize(a)? == std::fs::canonicalize(b)?)
+}
+
 fn ingest(
     draft_path: &Path,
     runs_path: &Path,
@@ -257,6 +271,21 @@ fn ingest(
         parse_draft(&read(draft_path)?).map_err(|e| format!("{}: {e}", draft_path.display()))?;
     let log =
         parse_run_log(&read(runs_path)?).map_err(|e| format!("{}: {e}", runs_path.display()))?;
+    // An ingest must never replace its own input. Compared by file identity, so the same
+    // file reached through another relative path, a symbolic link or a hard link counts.
+    if store_path.exists() {
+        for input in [draft_path, runs_path] {
+            let same =
+                same_file(store_path, input).map_err(|e| format!("{}: {e}", input.display()))?;
+            if same {
+                return Err(format!(
+                    "{} is an input of this ingest ({}); refusing to replace it",
+                    store_path.display(),
+                    input.display()
+                ));
+            }
+        }
+    }
     let s = store::ingest(
         store_path,
         &draft_path.to_string_lossy(),
