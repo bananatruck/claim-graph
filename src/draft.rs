@@ -258,7 +258,7 @@ impl Parser {
                 message,
             })?;
             let figures = extract_figures(&refs.plain).map_err(|e| ParseError {
-                line: paragraph.line_at(start + sentence.find(&e.as_written).unwrap_or(0)),
+                line: paragraph.line_at(start + refs.sentence_offset(e.offset)),
                 message: format!(
                     "the number `{}` cannot be held with its written precision by a 64-bit float, so it cannot be checked",
                     e.as_written
@@ -410,6 +410,20 @@ struct References {
     experiments: Vec<String>,
     /// The sentence with every reference marker replaced by a space.
     plain: String,
+    /// `(offset in plain, offset in the sentence)` where each copied stretch of `plain`
+    /// starts, in increasing order; a marker's space maps to the marker's `[`.
+    segments: Vec<(usize, usize)>,
+}
+
+impl References {
+    /// The byte offset in the sentence of byte `offset` of `plain`.
+    fn sentence_offset(&self, offset: usize) -> usize {
+        self.segments
+            .iter()
+            .rev()
+            .find(|(plain, _)| *plain <= offset)
+            .map_or(offset, |(plain, sentence)| sentence + (offset - plain))
+    }
 }
 
 /// Find `[@key; @key]` (or comma-separated), `[run:ID]` and `[exp:ID]` markers.
@@ -466,11 +480,14 @@ fn extract_references(sentence: &str) -> Result<References, (usize, String)> {
                 list.push(id.to_string());
             }
         }
+        refs.segments.push((refs.plain.len(), copied_to));
         refs.plain.push_str(&sentence[copied_to..open]);
+        refs.segments.push((refs.plain.len(), open));
         refs.plain.push(' ');
         search_from = open + 1 + close + 1;
         copied_to = search_from;
     }
+    refs.segments.push((refs.plain.len(), copied_to));
     refs.plain.push_str(&sentence[copied_to..]);
     Ok(refs)
 }
@@ -604,6 +621,18 @@ mod tests {
                 .unwrap_err();
         assert_eq!(error.line, 4, "{error}");
         assert!(error.message.contains("`1e-999`"), "{error}");
+    }
+
+    #[test]
+    fn a_rejected_number_is_reported_where_it_stands_not_where_its_text_first_appears() {
+        // `v1e-999` is an identifier and the marker holds no figure; only line 3 is rejected.
+        for draft in [
+            "Model v1e-999 is stable and\nloss is\n1e-999.\n",
+            "We cite [run:r1e-999] here and\nloss is\n1e-999.\n",
+        ] {
+            let error = parse_draft(draft).unwrap_err();
+            assert_eq!(error.line, 3, "{draft:?}: {error}");
+        }
     }
 
     #[test]

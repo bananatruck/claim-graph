@@ -56,6 +56,8 @@ pub struct Figure {
 pub struct Unrepresentable {
     /// The figure as written.
     pub as_written: String,
+    /// Its byte offset in the text given to `extract_figures`.
+    pub offset: usize,
 }
 
 const DASHES: [char; 3] = ['-', '\u{2212}', '\u{2013}'];
@@ -215,6 +217,7 @@ fn figure(text: &str, offset: usize, word: &str) -> Option<FigureRead> {
     {
         return Some(Err(Unrepresentable {
             as_written: word.to_string(),
+            offset,
         }));
     }
     Some(Ok(Figure {
@@ -539,11 +542,15 @@ mod tests {
             "1e-307%",
             "1e-999-2e-3",
             "loss 1e-999, then 2.5",
+            "v1e-999 then 1e-999",
             &long_integer,
             &long_decimal,
         ] {
             let error = extract_figures(text).unwrap_err();
-            assert!(text.contains(&error.as_written), "{text:?}: {error:?}");
+            assert!(
+                text[error.offset..].starts_with(&error.as_written),
+                "{text:?}: {error:?}"
+            );
         }
         // Representable exponents stay figures.
         for text in ["1e-300", "1e300", "1e-3", "2.5E+4", "1e-300%"] {
