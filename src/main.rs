@@ -255,7 +255,11 @@ fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
     Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
-/// Whether two paths reach one file: the same canonical path.
+/// Whether two paths reach one file: the same canonical path. Only Unix is built and tested.
+/// Elsewhere this refuses every path that resolves to the input's own name, which is what
+/// replacing would destroy; a hard-link alias is not detected, and replacing it replaces only
+/// that name, so the input keeps its content. Standard Rust has no stable file-identity API
+/// for Windows, and untested code would not be a guarantee.
 #[cfg(not(unix))]
 fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
     Ok(std::fs::canonicalize(a)? == std::fs::canonicalize(b)?)
