@@ -320,3 +320,28 @@ fn audit_and_explain_show_broken_references_and_mismatches() {
         "{stdout}"
     );
 }
+
+#[test]
+fn ingest_succeeds_when_the_reader_of_its_summary_has_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("out.rl");
+    let mut child = Command::new(BIN)
+        .args([
+            "ingest",
+            "--draft",
+            &input("data/synthetic/draft.md"),
+            "--runs",
+            &input("data/synthetic/runs.jsonl"),
+            "--store",
+            store.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close the read end before ingest writes its summary.
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(store.exists());
+}
