@@ -224,6 +224,7 @@ Exit status: 0 success, 1 runtime or input error, 2 usage error, 3 findings when
 
 Relate's `.rl` file is not byte-for-byte reproducible: rebuilding from the same inputs gives different bytes and the same graph.
 The committed stores are therefore checked by content: `cargo test` rebuilds both from their inputs into a temporary directory and compares the `dump` of each with the `dump` of the committed file.
+A dump names each node by its labels and properties, so the test also checks that no two nodes share both; otherwise two stores could differ in which of two identical nodes an edge uses and still dump alike.
 `scripts/rebuild-stores.sh` regenerates both stores with the documented commands.
 
 ## Limits

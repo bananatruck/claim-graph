@@ -422,11 +422,56 @@ fn committed_stores_match_a_rebuild_from_their_inputs() {
         let (_dir, rebuilt) = built(data);
         let expected = answers::dump(&rebuilt).unwrap();
         let actual = answers::dump(&root.join(committed)).unwrap();
+        assert_nodes_are_distinguishable(&expected, committed);
         assert_eq!(
             actual, expected,
             "{committed} is out of date; run scripts/rebuild-stores.sh"
         );
     }
+}
+
+/// A dump names each node by its labels and properties, so equal dumps mean the same graph
+/// only when no two nodes share both. Checked on every store the rebuild test compares.
+fn assert_nodes_are_distinguishable(dump: &[String], what: &str) {
+    let nodes: Vec<&String> = dump.iter().filter(|line| !line.contains("]->")).collect();
+    let unique: std::collections::BTreeSet<&&String> = nodes.iter().collect();
+    assert_eq!(
+        unique.len(),
+        nodes.len(),
+        "{what} has nodes with the same labels and properties; its dump cannot tell them apart"
+    );
+}
+
+/// Two graphs that differ only in which of two identical nodes an edge uses have equal dumps;
+/// the distinguishability check refuses to vouch for either.
+#[test]
+fn equal_dumps_vouch_for_a_graph_only_when_its_nodes_are_distinguishable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dumps = Vec::new();
+    for (name, second_target) in [("a.rl", "m1"), ("b.rl", "m2")] {
+        let path = dir.path().join(name);
+        let db = Database::open_with(
+            path.to_str().unwrap(),
+            relate::OpenOptions {
+                snapshot_codec: Some(relate::SnapshotCodecKind::Json),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut conn = db.connect().unwrap();
+        conn.query(&format!(
+            "CREATE (a:F {{k: 1}}), (b:F {{k: 2}}), (m1:M {{v: 1}}), (m2:M {{v: 1}}), \
+             (a)-[:R]->(m1), (b)-[:R]->({second_target})"
+        ))
+        .unwrap();
+        db.checkpoint().unwrap();
+        drop(conn);
+        drop(db);
+        dumps.push(answers::dump(&path).unwrap());
+    }
+    assert_eq!(dumps[0], dumps[1], "the dump cannot see the difference");
+    let refused = std::panic::catch_unwind(|| assert_nodes_are_distinguishable(&dumps[0], "a.rl"));
+    assert!(refused.is_err());
 }
 
 /// Built without the `parquet` feature, the store uses Relate's JSON snapshot codec,
